@@ -1,4 +1,4 @@
-CasTorrent
+#CasTorrent
 
 CasTorrent is a lightweight and user-friendly Python-based torrent manager. It allows you to download and seed torrents efficiently while keeping everything organized.
 
