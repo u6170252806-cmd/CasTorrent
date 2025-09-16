@@ -1,3 +1,4 @@
+
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -170,14 +171,17 @@ class TorrentClient:
 		self.apply_initial_session_settings()
 
 		self.torrents = {}  # hash -> {'handle','added_time','source','save_path','moved'}
-		self.download_history = deque(maxlen=1000)
+		self.download_history = deque(maxlen=3000)
 
 		self.performance_stats = {
-			'download_speeds': deque(maxlen=300),
-			'upload_speeds': deque(maxlen=300),
-			'memory_usage': deque(maxlen=300),
-			'cpu_usage': deque(maxlen=300),
+			'download_speeds': deque(maxlen=600),
+			'upload_speeds': deque(maxlen=600),
+			'memory_usage': deque(maxlen=600),
+			'cpu_usage': deque(maxlen=600),
 		}
+
+		# Live status rendering (single-line per torrent, refreshed)
+		self._last_live_status_render = 0
 
 		self.root = tk.Tk()
 		self.setup_gui()
@@ -207,7 +211,7 @@ class TorrentClient:
 
 	def setup_gui(self):
 		self.root.title("Advanced BitTorrent Client")
-		self.root.geometry("1320x880")
+		self.root.geometry("1380x920")
 		self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
 		self.create_menu()
@@ -240,6 +244,7 @@ class TorrentClient:
 		menubar.add_cascade(label="File", menu=file_menu)
 		file_menu.add_command(label="Add Torrent File(s)...", command=self.add_torrent_files, accelerator="Ctrl+O")
 		file_menu.add_command(label="Add Magnet Link...", command=self.add_magnet_dialog, accelerator="Ctrl+M")
+		file_menu.add_command(label="Add Multiple Magnets...", command=self.add_multi_magnets_dialog)
 		file_menu.add_command(label="Add from URL...", command=self.add_url_dialog)
 		file_menu.add_separator()
 		file_menu.add_command(label="Save As (copy/move completed)...", command=self.save_as_selected)
@@ -256,7 +261,9 @@ class TorrentClient:
 		view_menu = tk.Menu(menubar, tearoff=0)
 		menubar.add_cascade(label="View", menu=view_menu)
 		self.hide_completed_var = tk.BooleanVar(value=False)
+		self.live_status_var = tk.BooleanVar(value=True)  # show single-line live status
 		view_menu.add_checkbutton(label="Hide Completed/Seeding", variable=self.hide_completed_var, command=self.refresh_filter_view)
+		view_menu.add_checkbutton(label="Show Live Status Panel", variable=self.live_status_var, command=self.toggle_live_status_panel)
 		view_menu.add_command(label="Show Performance Graph", command=self.show_performance_graph)
 		view_menu.add_command(label="Show Download History", command=self.show_download_history)
 
@@ -264,10 +271,13 @@ class TorrentClient:
 		menubar.add_cascade(label="Torrent", menu=torrent_menu)
 		torrent_menu.add_command(label="Start", command=self.start_selected)
 		torrent_menu.add_command(label="Pause", command=self.pause_selected)
-		torrent_menu.add_command(label="Force Resume", command=self.force_resume_selected)
+		torrent_menu.add_command(label="Resume", command=self.force_resume_selected)
+		torrent_menu.add_command(label="Stop (halt seeding)", command=self.stop_selected)
 		torrent_menu.add_separator()
 		torrent_menu.add_command(label="Remove", command=self.remove_selected, accelerator="Delete")
+		torrent_menu.add_command(label="Remove and Delete Data", command=self.remove_and_delete_selected)
 		torrent_menu.add_command(label="Open Folder", command=self.open_folder)
+		torrent_menu.add_command(label="Open File Location", command=self.open_file_location)
 		torrent_menu.add_separator()
 		torrent_menu.add_command(label="Force Recheck", command=self.force_recheck)
 		torrent_menu.add_command(label="Force Reannounce", command=self.force_reannounce)
@@ -292,11 +302,16 @@ class TorrentClient:
 
 		ttk.Button(toolbar, text="Add Torrent(s)", command=self.add_torrent_files).pack(side=tk.LEFT, padx=(0, 5))
 		ttk.Button(toolbar, text="Add Magnet", command=self.add_magnet_dialog).pack(side=tk.LEFT, padx=(0, 5))
+		ttk.Button(toolbar, text="Add Multi Magnets", command=self.add_multi_magnets_dialog).pack(side=tk.LEFT, padx=(0, 5))
 		ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
 		ttk.Button(toolbar, text="Start", command=self.start_selected).pack(side=tk.LEFT, padx=(0, 5))
 		ttk.Button(toolbar, text="Pause", command=self.pause_selected).pack(side=tk.LEFT, padx=(0, 5))
 		ttk.Button(toolbar, text="Resume", command=self.force_resume_selected).pack(side=tk.LEFT, padx=(0, 5))
+		ttk.Button(toolbar, text="Stop", command=self.stop_selected).pack(side=tk.LEFT, padx=(0, 5))
 		ttk.Button(toolbar, text="Remove", command=self.remove_selected).pack(side=tk.LEFT, padx=(0, 5))
+		ttk.Button(toolbar, text="Remove+Data", command=self.remove_and_delete_selected).pack(side=tk.LEFT, padx=(0, 5))
+		ttk.Button(toolbar, text="Open Folder", command=self.open_folder).pack(side=tk.LEFT, padx=(0, 5))
+		ttk.Button(toolbar, text="Open File Location", command=self.open_file_location).pack(side=tk.LEFT, padx=(0, 5))
 		ttk.Button(toolbar, text="Save As", command=self.save_as_selected).pack(side=tk.LEFT, padx=(0, 5))
 		ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
 
@@ -331,9 +346,9 @@ class TorrentClient:
 		tree_frame.pack(fill=tk.BOTH, expand=True)
 
 		columns = ('Name', 'Size', 'Progress', 'Status', 'Seeds', 'Peers', 'Down Speed', 'Up Speed', 'ETA', 'Ratio', 'Added On')
-		self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=20)
+		self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=22)
 
-		column_widths = [360, 120, 90, 120, 80, 80, 120, 120, 90, 80, 170]
+		column_widths = [400, 120, 90, 120, 80, 80, 120, 120, 90, 80, 170]
 		for i, (col, width) in enumerate(zip(columns, column_widths)):
 			self.tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(c))
 			self.tree.column(col, width=width, anchor='center' if i > 0 else 'w')
@@ -376,7 +391,7 @@ class TorrentClient:
 		self.create_trackers_tab()
 
 		self.log_frame = ttk.Frame(self.notebook)
-		self.notebook.add(self.log_frame, text="Log")
+		self.notebook.add(self.log_frame, text="Log + Live")
 		self.create_log_tab()
 
 		self.performance_frame = ttk.Frame(self.notebook)
@@ -397,7 +412,7 @@ class TorrentClient:
 		self.files_tree = ttk.Treeview(files_frame, columns=files_columns, show='tree headings')
 		for col in files_columns:
 			self.files_tree.heading(col, text=col)
-			self.files_tree.column(col, width=190)
+			self.files_tree.column(col, width=220 if col == 'File' else 160)
 
 		files_v_scroll = ttk.Scrollbar(files_frame, orient=tk.VERTICAL, command=self.files_tree.yview)
 		files_h_scroll = ttk.Scrollbar(files_frame, orient=tk.HORIZONTAL, command=self.files_tree.xview)
@@ -414,7 +429,7 @@ class TorrentClient:
 		self.peers_tree = ttk.Treeview(self.peers_frame, columns=peers_columns, show='headings')
 		for col in peers_columns:
 			self.peers_tree.heading(col, text=col)
-			self.peers_tree.column(col, width=150)
+			self.peers_tree.column(col, width=160)
 		peers_scroll = ttk.Scrollbar(self.peers_frame, orient=tk.VERTICAL, command=self.peers_tree.yview)
 		self.peers_tree.configure(yscrollcommand=peers_scroll.set)
 		self.peers_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -425,22 +440,48 @@ class TorrentClient:
 		self.trackers_tree = ttk.Treeview(self.trackers_frame, columns=trackers_columns, show='headings')
 		for col in trackers_columns:
 			self.trackers_tree.heading(col, text=col)
-			self.trackers_tree.column(col, width=280)
+			self.trackers_tree.column(col, width=400 if col == 'URL' else 400)
 		trackers_scroll = ttk.Scrollbar(self.trackers_frame, orient=tk.VERTICAL, command=self.trackers_tree.yview)
 		self.trackers_tree.configure(yscrollcommand=trackers_scroll.set)
 		self.trackers_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 		trackers_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
 
 	def create_log_tab(self):
-		log_controls = ttk.Frame(self.log_frame)
-		log_controls.pack(fill=tk.X, padx=5, pady=(5, 0))
+		wrap = ttk.Frame(self.log_frame)
+		wrap.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+		left = ttk.Frame(wrap)
+		left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+		right = ttk.Frame(wrap)
+		right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+		log_controls = ttk.Frame(left)
+		log_controls.pack(fill=tk.X, pady=(0, 5))
 		ttk.Button(log_controls, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT)
 		ttk.Button(log_controls, text="Save Log", command=self.save_log).pack(side=tk.LEFT, padx=(5, 0))
 
-		self.log_text = scrolledtext.ScrolledText(self.log_frame, height=10, wrap=tk.WORD)
-		self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+		self.log_text = scrolledtext.ScrolledText(left, height=14, wrap=tk.WORD)
+		self.log_text.pack(fill=tk.BOTH, expand=True)
 		self.log_text.config(state=tk.DISABLED)
 		self.log("BitTorrent client started")
+
+		live_controls = ttk.Frame(right)
+		live_controls.pack(fill=tk.X, pady=(0, 5))
+		ttk.Label(live_controls, text="Live Status (one line per torrent)").pack(side=tk.LEFT)
+		self.live_status_text = scrolledtext.ScrolledText(right, height=14, wrap=tk.NONE)
+		self.live_status_text.pack(fill=tk.BOTH, expand=True)
+		self.live_status_text.config(state=tk.DISABLED)
+
+	def toggle_live_status_panel(self):
+		visible = self.live_status_var.get()
+		try:
+			self.live_status_text.configure(state=tk.NORMAL)
+			self.live_status_text.delete(1.0, tk.END)
+			if visible:
+				self.live_status_text.insert(tk.END, "Live status enabled.\n")
+			self.live_status_text.configure(state=tk.DISABLED)
+		except Exception:
+			pass
 
 	def create_performance_tab(self):
 		perf_frame = ttk.Frame(self.performance_frame)
@@ -489,6 +530,9 @@ class TorrentClient:
 		self.speed_label = ttk.Label(self.status_bar, text="↓ 0 kB/s ↑ 0 kB/s")
 		self.speed_label.pack(side=tk.RIGHT, padx=(5, 0))
 
+	def ask_fast_download_options(self):
+		return FastDownloadDialog(self.root, self.config).result
+
 	def add_torrent_files(self):
 		paths = filedialog.askopenfilenames(
 			title="Select Torrent File(s)",
@@ -497,10 +541,11 @@ class TorrentClient:
 		)
 		if not paths:
 			return
+		fd = self.ask_fast_download_options()
 		default_save = self.config.get('download_path', str(platform_downloads_dir()))
 		for file_path in paths:
 			try:
-				self.add_torrent(file_path, default_save)
+				self.add_torrent(file_path, default_save, fast_download=fd)
 			except Exception as e:
 				self.log(f"Failed adding {file_path}: {e}")
 		self.config['last_opened_torrent_dir'] = str(Path(paths[-1]).parent)
@@ -510,28 +555,61 @@ class TorrentClient:
 		dialog = MagnetDialog(self.root, self.config.get('download_path', str(platform_downloads_dir())))
 		magnet_uri, save_path = dialog.result if dialog.result else (None, None)
 		if magnet_uri and save_path:
-			self.add_torrent(magnet_uri, save_path)
+			fd = self.ask_fast_download_options()
+			self.add_torrent(magnet_uri, save_path, fast_download=fd)
+
+	def add_multi_magnets_dialog(self):
+		dialog = MultiMagnetDialog(self.root, self.config.get('download_path', str(platform_downloads_dir())))
+		result = dialog.result
+		if not result:
+			return
+		save_path, magnets = result
+		fd = self.ask_fast_download_options()
+		for m in magnets:
+			try:
+				self.add_torrent(m, save_path, fast_download=fd)
+			except Exception as e:
+				self.log(f"Add magnet failed: {e}")
 
 	def add_url_dialog(self):
 		dialog = UrlDialog(self.root, self.config.get('download_path', str(platform_downloads_dir())))
 		url, save_path = dialog.result if dialog.result else (None, None)
 		if url and save_path:
-			self.download_torrent_from_url(url, save_path)
+			fd = self.ask_fast_download_options()
+			self.download_torrent_from_url(url, save_path, fast_download=fd)
 
-	def download_torrent_from_url(self, url, save_path):
+	def download_torrent_from_url(self, url, save_path, fast_download=None):
 		try:
 			self.log(f"Downloading torrent from URL: {url}")
 			r = requests.get(url, timeout=30)
 			r.raise_for_status()
 			tmp = Path(f"temp_{int(time.time())}.torrent")
 			tmp.write_bytes(r.content)
-			self.add_torrent(str(tmp), save_path)
+			self.add_torrent(str(tmp), save_path, fast_download=fast_download)
 			threading.Timer(5.0, lambda: tmp.exists() and tmp.unlink()).start()
 		except Exception as e:
 			messagebox.showerror("Error", f"Failed to download/add torrent: {e}")
 			self.log(f"URL add error: {e}")
 
-	def add_torrent(self, torrent_source, save_path=None):
+	def apply_fast_download(self, handle, fast_download):
+		try:
+			if not fast_download or not fast_download.get('enabled', False):
+				return
+			connections = int(fast_download.get('connections', 5))
+			# Approximate multi-connection acceleration:
+			# - raise per-torrent peer limit
+			# - enable sequential if requested (default True for "fast download")
+			if lt_has(handle, 'set_max_connections'):
+				handle.set_max_connections(max(20, connections * 50))
+			if fast_download.get('sequential', True) and lt_has(handle, 'set_sequential_download'):
+				handle.set_sequential_download(True)
+			# remove upload-only if present
+			if lt_has(handle, 'set_upload_mode'):
+				handle.set_upload_mode(False)
+		except Exception:
+			pass
+
+	def add_torrent(self, torrent_source, save_path=None, fast_download=None):
 		if save_path is None:
 			save_path = self.config.get('download_path', str(platform_downloads_dir()))
 		Path(save_path).mkdir(parents=True, exist_ok=True)
@@ -550,6 +628,8 @@ class TorrentClient:
 			handle = self.session.add_torrent(params)
 			source_type = 'file'
 			name_hint = info.name()
+
+		self.apply_fast_download(handle, fast_download)
 
 		t_hash = safe_info_hash_str(handle)
 		if t_hash in self.torrents:
@@ -598,6 +678,7 @@ class TorrentClient:
 			self.update_status_bar()
 			self.update_performance_stats()
 			self.auto_move_completed()
+			self.update_live_status()  # single-line per torrent
 			if self.hide_completed_var.get():
 				self.refresh_filter_view()
 		except Exception as e:
@@ -750,13 +831,15 @@ class TorrentClient:
 		def fmt_time(seconds):
 			return self.format_time(int(seconds or 0))
 
-		info_text = f"""Name: {getattr(status, 'name', '') or (handle.name() if lt_has(handle, "name") else 'N/A')}
+		content_name = getattr(status, 'name', '') or (handle.name() if lt_has(handle, "name") else 'N/A')
+
+		info_text = f"""Name: {content_name}
 Size: {self.format_bytes(getattr(status, 'total_wanted', 0))}
 Progress: {getattr(status, 'progress', 0.0) * 100:.2f}%
 Status: {self.get_status_text(status)}
 Download Rate: {self.format_speed(getattr(status, 'download_rate', 0))}
 Upload Rate: {self.format_speed(getattr(status, 'upload_rate', 0))}
-Seeds: {getattr(status, 'num_seeds', 0)} connected, {getattr(status, 'num_complete', 0)} total
+Seeds: {getattr(status, 'num_seeds', 0)} connected, {getattr(status, 'num_complete', 0)}) total
 Peers: {getattr(status, 'num_peers', 0)} connected, {getattr(status, 'num_incomplete', 0)} total
 Downloaded: {self.format_bytes(getattr(status, 'total_done', 0))}
 Uploaded: {self.format_bytes(getattr(status, 'total_upload', 0))}
@@ -764,6 +847,7 @@ Ratio: {float(getattr(status, 'total_upload', 0)) / max(float(getattr(status, 't
 Time Active: {fmt_time(getattr(status, 'active_time', 0))}
 Seeding Time: {fmt_time(getattr(status, 'seeding_time', 0))}
 Save Path: {getattr(status, 'save_path', '')}
+Top-Level Path: {(Path(getattr(status, 'save_path', '')) / content_name) if content_name not in ('N/A','') else ''}
 Hash: {safe_info_hash_str(handle)}
 Created By: {(torrent_info.creator() if torrent_info and hasattr(torrent_info, 'creator') else 'Unknown')}
 Created On: {creation_date_str}
@@ -987,6 +1071,35 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		self.perf_text.insert(tk.END, stats_text)
 		self.perf_text.config(state=tk.DISABLED)
 
+	def update_live_status(self):
+		now = time.time()
+		if not self.live_status_var.get():
+			return
+		# throttle to ~2Hz
+		if now - self._last_live_status_render < 0.5:
+			return
+		self._last_live_status_render = now
+		lines = []
+		for hsh, info in self.torrents.items():
+			h = info['handle']
+			try:
+				st = h.status()
+				name = getattr(st, 'name', '') or (h.name() if lt_has(h, 'name') else hsh[:10])
+				state = self.get_status_text(st)
+				prog = f"{getattr(st, 'progress', 0.0) * 100:.1f}%"
+				ds = self.format_speed(getattr(st, 'download_rate', 0))
+				us = self.format_speed(getattr(st, 'upload_rate', 0))
+				lines.append(f"{name} | {prog} | {state} | ↓ {ds} ↑ {us}")
+			except Exception:
+				continue
+		try:
+			self.live_status_text.config(state=tk.NORMAL)
+			self.live_status_text.delete(1.0, tk.END)
+			self.live_status_text.insert(tk.END, "\n".join(lines) if lines else "No torrents yet.")
+			self.live_status_text.config(state=tk.DISABLED)
+		except Exception:
+			pass
+
 	def auto_move_completed(self):
 		completed_root = Path(self.config.get('completed_path', str(platform_downloads_dir() / "Completed")))
 		try:
@@ -1045,6 +1158,8 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 			return
 		try:
 			h.resume()
+			if lt_has(h, 'set_upload_mode'):
+				h.set_upload_mode(False)
 			self.log(f"Started: {h.name() if lt_has(h, 'name') else ''}")
 		except Exception as e:
 			self.log(f"Start error: {e}")
@@ -1062,6 +1177,21 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		except Exception as e:
 			self.log(f"Pause error: {e}")
 
+	def stop_selected(self):
+		item = self.get_single_selection()
+		if not item:
+			return
+		h = self.get_handle_from_item(item)
+		if not h:
+			return
+		try:
+			if lt_has(h, 'set_upload_mode'):
+				h.set_upload_mode(True)
+			h.pause()
+			self.log("Stopped (seeding halted)")
+		except Exception as e:
+			self.log(f"Stop error: {e}")
+
 	def force_resume_selected(self):
 		item = self.get_single_selection()
 		if not item:
@@ -1070,6 +1200,8 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		if not h:
 			return
 		try:
+			if lt_has(h, 'set_upload_mode'):
+				h.set_upload_mode(False)
 			h.resume()
 			self.log("Forced resume")
 		except Exception as e:
@@ -1085,6 +1217,8 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		try:
 			st = h.status()
 			if getattr(st, "paused", False):
+				if lt_has(h, 'set_upload_mode'):
+					h.set_upload_mode(False)
 				h.resume()
 				self.log(f"Resumed: {h.name() if lt_has(h, 'name') else ''}")
 			else:
@@ -1097,24 +1231,47 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		item = self.get_single_selection()
 		if not item:
 			return
-		ans = messagebox.askyesnocancel(
-			"Remove Torrent",
-			"Remove torrent from list?\n\nYes = Remove from list only\nNo = Remove torrent and data\nCancel = Do nothing"
-		)
-		if ans is None:
+		if not messagebox.askyesno("Remove Torrent", "Remove torrent from list only? Data will remain on disk."):
 			return
+		self._remove_common(item, delete_data=False)
+
+	def remove_and_delete_selected(self):
+		item = self.get_single_selection()
+		if not item:
+			return
+		if not messagebox.askyesno("Remove & Delete Data", "Remove torrent and delete its downloaded data from disk?"):
+			return
+		self._remove_common(item, delete_data=True)
+
+	def _remove_common(self, item, delete_data=False):
 		h = self.get_handle_from_item(item)
 		if not h:
 			return
 		try:
-			if ans:
-				self.session.remove_torrent(h)
+			if delete_data:
+				try:
+					flag = getattr(getattr(lt, 'options_t', object()), 'delete_files', 1)
+					self.session.remove_torrent(h, flag)
+				except Exception:
+					self.session.remove_torrent(h)
+					try:
+						st = h.status()
+						name = getattr(st, 'name', '') or (h.name() if lt_has(h, 'name') else '')
+						base = Path(getattr(st, 'save_path', ''))
+						target = (base / name) if name else base
+						if target.exists():
+							if target.is_dir():
+								shutil.rmtree(target, ignore_errors=True)
+							else:
+								target.unlink(missing_ok=True)
+					except Exception:
+						pass
 			else:
-				self.session.remove_torrent(h, lt.options_t.delete_files)
+				self.session.remove_torrent(h)
 			t_hash = self.tree.item(item)['tags'][0]
 			self.torrents.pop(t_hash, None)
 			self.tree.delete(item)
-			self.log("Removed torrent")
+			self.log("Removed torrent" + (" and data" if delete_data else ""))
 		except Exception as e:
 			self.log(f"Remove error: {e}")
 
@@ -1193,15 +1350,44 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		if not h:
 			return
 		st = h.status()
-		save_path = getattr(st, "save_path", "")
-		if save_path and Path(save_path).exists():
+		content_name = getattr(st, "name", "") or (h.name() if lt_has(h, 'name') else "")
+		save_path = Path(getattr(st, "save_path", ""))
+		target = save_path if not content_name else (save_path / content_name)
+		if target.exists():
 			try:
-				open_path_in_os(Path(save_path))
+				open_path_in_os(target if target.is_dir() else target.parent)
 			except Exception as e:
 				self.log(str(e))
 				messagebox.showerror("Error", str(e))
 		else:
-			messagebox.showinfo("Info", "Download path does not exist.")
+			if save_path.exists():
+				open_path_in_os(save_path)
+			else:
+				messagebox.showinfo("Info", "Download path does not exist.")
+
+	def open_file_location(self):
+		item = self.get_single_selection()
+		if not item:
+			return
+		h = self.get_handle_from_item(item)
+		if not h:
+			return
+		try:
+			st = h.status()
+			name = getattr(st, "name", "") or (h.name() if lt_has(h, 'name') else "")
+			base = Path(getattr(st, "save_path", ""))
+			if name:
+				target = base / name
+				if target.exists():
+					open_path_in_os(target if target.is_dir() else target.parent)
+					return
+			if base.exists():
+				open_path_in_os(base)
+			else:
+				messagebox.showinfo("Info", "File location not found yet.")
+		except Exception as e:
+			self.log(f"Open file location error: {e}")
+			messagebox.showerror("Error", str(e))
 
 	def copy_magnet_link(self):
 		item = self.get_single_selection()
@@ -1296,9 +1482,12 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 			menu.add_command(label="Start", command=self.start_selected)
 			menu.add_command(label="Pause", command=self.pause_selected)
 			menu.add_command(label="Resume", command=self.force_resume_selected)
+			menu.add_command(label="Stop", command=self.stop_selected)
 			menu.add_separator()
 			menu.add_command(label="Remove", command=self.remove_selected)
+			menu.add_command(label="Remove + Data", command=self.remove_and_delete_selected)
 			menu.add_command(label="Open Folder", command=self.open_folder)
+			menu.add_command(label="Open File Location", command=self.open_file_location)
 			menu.add_separator()
 			menu.add_command(label="Force Recheck", command=self.force_recheck)
 			menu.add_command(label="Force Reannounce", command=self.force_reannounce)
@@ -1480,7 +1669,10 @@ Tkinter: {tk.TkVersion}
 			'global_ul_limit': 0,
 			'last_opened_torrent_dir': default_downloads,
 			'last_saved_torrent_dir': default_downloads,
-			'log_level': 'INFO'
+			'log_level': 'INFO',
+			'fast_download_default_enabled': True,
+			'fast_download_default_connections': 5,
+			'fast_download_sequential': True
 		}
 		try:
 			if Path(config_file).exists():
@@ -1586,7 +1778,7 @@ Tkinter: {tk.TkVersion}
 			self.session = None
 			self.root.destroy()
 
-	# ========== Added missing actions and helpers ==========
+	# Quick actions and helpers
 
 	def show_speed_limits(self):
 		SpeedLimitsDialog(self.root, self.session)
@@ -1665,6 +1857,64 @@ Tkinter: {tk.TkVersion}
 		except Exception:
 			logger.info(msg)
 
+class FastDownloadDialog:
+	def __init__(self, parent, config):
+		self.result = {
+			'enabled': config.get('fast_download_default_enabled', True),
+			'connections': config.get('fast_download_default_connections', 5),
+			'sequential': config.get('fast_download_sequential', True)
+		}
+		self.dialog = tk.Toplevel(parent)
+		self.dialog.title("Fast Download")
+		self.dialog.transient(parent)
+		self.dialog.grab_set()
+		self.dialog.resizable(False, False)
+		self.dialog.update_idletasks()
+		x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
+		y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
+		self.dialog.geometry(f"+{x}+{y}")
+
+		main = ttk.Frame(self.dialog, padding="10 10 10 10")
+		main.pack(fill=tk.BOTH, expand=True)
+
+		self.enable_var = tk.BooleanVar(value=self.result['enabled'])
+		ttk.Checkbutton(main, text="Enable Fast Download (multi-connection per torrent)", variable=self.enable_var).pack(anchor=tk.W, pady=(0, 8))
+
+		row = ttk.Frame(main)
+		row.pack(fill=tk.X, pady=(0, 8))
+		ttk.Label(row, text="Connections:").pack(side=tk.LEFT)
+		self.conn_var = tk.StringVar(value=str(self.result['connections']))
+		ttk.Entry(row, textvariable=self.conn_var, width=6).pack(side=tk.LEFT, padx=(6, 0))
+		ttk.Label(row, text="(suggest 5–10)").pack(side=tk.LEFT, padx=(6, 0))
+
+		self.seq_var = tk.BooleanVar(value=self.result['sequential'])
+		ttk.Checkbutton(main, text="Sequential download (improves playback start, stable speed)", variable=self.seq_var).pack(anchor=tk.W)
+
+		btns = ttk.Frame(main)
+		btns.pack(fill=tk.X, pady=(10, 0))
+		ttk.Button(btns, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
+		ttk.Button(btns, text="OK", command=self.ok).pack(side=tk.RIGHT, padx=(0, 6))
+
+		self.dialog.bind('<Return>', lambda e: self.ok())
+		self.dialog.wait_window()
+
+	def ok(self):
+		try:
+			conns = max(1, min(50, int(float(self.conn_var.get()))))
+		except Exception:
+			conns = 5
+		self.result = {
+			'enabled': bool(self.enable_var.get()),
+			'connections': conns,
+			'sequential': bool(self.seq_var.get())
+		}
+		self.dialog.destroy()
+
+	def cancel(self):
+		# Keep defaults as "disabled" so it's safe
+		self.result = {'enabled': False, 'connections': 5, 'sequential': True}
+		self.dialog.destroy()
+
 class MagnetDialog:
 	def __init__(self, parent, default_path):
 		self.result = None
@@ -1714,6 +1964,59 @@ class MagnetDialog:
 			self.dialog.destroy()
 		else:
 			messagebox.showerror("Invalid Magnet", "Enter a valid magnet URI.", parent=self.dialog)
+
+	def cancel(self):
+		self.dialog.destroy()
+
+class MultiMagnetDialog:
+	def __init__(self, parent, default_path):
+		self.result = None
+		self.dialog = tk.Toplevel(parent)
+		self.dialog.title("Add Multiple Magnets")
+		self.dialog.transient(parent)
+		self.dialog.grab_set()
+		self.dialog.geometry("680x400")
+		self.dialog.update_idletasks()
+		x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
+		y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
+		self.dialog.geometry(f"+{x}+{y}")
+		self.dialog.resizable(True, True)
+
+		main = ttk.Frame(self.dialog, padding="10 10 10 10")
+		main.pack(fill=tk.BOTH, expand=True)
+
+		ttk.Label(main, text="Paste one magnet URI per line:").pack(anchor=tk.W, pady=(0, 5))
+		self.text = scrolledtext.ScrolledText(main, wrap=tk.WORD, height=12)
+		self.text.pack(fill=tk.BOTH, expand=True)
+
+		ttk.Label(main, text="Download Path:").pack(anchor=tk.W, pady=(10, 5))
+		path_frame = ttk.Frame(main)
+		path_frame.pack(fill=tk.X)
+		self.path_var = tk.StringVar(value=default_path)
+		ttk.Entry(path_frame, textvariable=self.path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+		ttk.Button(path_frame, text="Browse...", command=self.browse_path).pack(side=tk.RIGHT, padx=(5, 0))
+
+		btns = ttk.Frame(main, padding="0 10 10 0")
+		btns.pack(fill=tk.X, pady=(10, 0))
+		ttk.Button(btns, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
+		ttk.Button(btns, text="Add All", command=self.add_all).pack(side=tk.RIGHT, padx=(0, 5))
+
+		self.dialog.wait_window()
+
+	def browse_path(self):
+		path = filedialog.askdirectory(initialdir=self.path_var.get(), parent=self.dialog)
+		if path:
+			self.path_var.set(path)
+
+	def add_all(self):
+		raw = self.text.get(1.0, tk.END).strip()
+		lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+		magnets = [ln for ln in lines if ln.startswith("magnet:")]
+		if not magnets:
+			messagebox.showerror("Invalid Input", "Paste at least one magnet URI.", parent=self.dialog)
+			return
+		self.result = (self.path_var.get(), magnets)
+		self.dialog.destroy()
 
 	def cancel(self):
 		self.dialog.destroy()
@@ -1825,6 +2128,19 @@ class SettingsDialog:
 		ttk.Entry(comp_frame, textvariable=self.completed_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
 		ttk.Button(comp_frame, text="Browse...", command=self.browse_completed_path).pack(side=tk.RIGHT, padx=(5, 0))
 
+		ttk.Label(parent, text="Fast Download default:").pack(anchor=tk.W, pady=(0, 5))
+		fd_frame = ttk.Frame(parent)
+		fd_frame.pack(fill=tk.X, pady=(0, 10))
+		self.fd_enabled_var = tk.BooleanVar(value=self.config.get('fast_download_default_enabled', True))
+		ttk.Checkbutton(fd_frame, text="Enable by default", variable=self.fd_enabled_var).pack(anchor=tk.W)
+		fd2 = ttk.Frame(parent)
+		fd2.pack(fill=tk.X, pady=(0, 10))
+		ttk.Label(fd2, text="Connections:").pack(side=tk.LEFT)
+		self.fd_conn_var = tk.StringVar(value=str(self.config.get('fast_download_default_connections', 5)))
+		ttk.Entry(fd2, textvariable=self.fd_conn_var, width=6).pack(side=tk.LEFT, padx=(6, 0))
+		self.fd_seq_var = tk.BooleanVar(value=self.config.get('fast_download_sequential', True))
+		ttk.Checkbutton(parent, text="Sequential download default", variable=self.fd_seq_var).pack(anchor=tk.W)
+
 	def create_connection_settings(self, parent):
 		ttk.Label(parent, text="Maximum Connections:").pack(anchor=tk.W, pady=(0, 5))
 		self.max_connections_var = tk.StringVar(value=str(self.config.get('max_connections', 500)))
@@ -1883,7 +2199,10 @@ class SettingsDialog:
 				'enable_upnp': True,
 				'enable_natpmp': True,
 				'global_dl_limit': max(0, dl_limit_val),
-				'global_ul_limit': max(0, ul_limit_val)
+				'global_ul_limit': max(0, ul_limit_val),
+				'fast_download_default_enabled': bool(self.fd_enabled_var.get()),
+				'fast_download_default_connections': max(1, min(50, int(float(self.fd_conn_var.get()) if self.fd_conn_var.get() else 5))),
+				'fast_download_sequential': bool(self.fd_seq_var.get())
 			}
 			self.apply_callback(new_config)
 			self.dialog.destroy()
