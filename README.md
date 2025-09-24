@@ -9,3 +9,5 @@ Designed for simplicity and performance, CasTorrent gives you all the essential 
 Please download the stable build if you want you can try the beta testing but things might not work (proxies etc), only download if you want to expirment with new features
 
 7 stars for update
+
+Join https://discord.gg/E78F5mYJ for offical support server
