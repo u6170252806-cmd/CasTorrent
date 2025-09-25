@@ -1,4 +1,3 @@
-
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -170,20 +169,24 @@ class TorrentClient:
 		self.session = lt.session()
 		self.apply_initial_session_settings()
 
-		self.torrents = {}  # hash -> {'handle','added_time','source','save_path','moved'}
-		self.download_history = deque(maxlen=3000)
+		self.torrents = {}
+		self.download_history = deque(maxlen=5000)
 
 		self.performance_stats = {
-			'download_speeds': deque(maxlen=600),
-			'upload_speeds': deque(maxlen=600),
-			'memory_usage': deque(maxlen=600),
-			'cpu_usage': deque(maxlen=600),
+			'download_speeds': deque(maxlen=1200),
+			'upload_speeds': deque(maxlen=1200),
+			'memory_usage': deque(maxlen=1200),
+			'cpu_usage': deque(maxlen=1200),
 		}
 
-		# Live status rendering (single-line per torrent, refreshed)
 		self._last_live_status_render = 0
+		self._live_status_line_to_hash = {}
 
 		self.root = tk.Tk()
+		self._bg_image_obj = None
+		self._bg_label = None
+		self._text_widgets = []
+
 		self.setup_gui()
 
 		self.running = True
@@ -191,10 +194,12 @@ class TorrentClient:
 		self.update_thread.start()
 
 	def apply_initial_session_settings(self):
-		session_set_max_connections(self.session, self.config.get('max_connections', 500))
-		session_set_max_uploads(self.session, self.config.get('max_uploads', 50))
+		session_set_max_connections(self.session, self.config.get('max_connections', 4000))
+		session_set_max_uploads(self.session, self.config.get('max_uploads', 1000))
 		session_set_download_rate_limit(self.session, self.config.get('global_dl_limit', 0))
 		session_set_upload_rate_limit(self.session, self.config.get('global_ul_limit', 0))
+
+		self.apply_speed_tuning()
 
 		port_range = self.config.get('port_range', [6881, 6891])
 		if not session_listen_on(self.session, port_range[0], port_range[1]):
@@ -209,10 +214,109 @@ class TorrentClient:
 
 		load_session_state_safe(self.session)
 
+	def apply_speed_tuning(self):
+		try:
+			sp = lt.settings_pack()
+			set_int = getattr(sp, 'set_int')
+			set_bool = getattr(sp, 'set_bool')
+			set_str = getattr(sp, 'set_str')
+
+			# Connection and requests (aggressive for high throughput)
+			if hasattr(lt.settings_pack, 'connections_limit'):
+				set_int(lt.settings_pack.connections_limit, int(self.config.get('max_connections', 4000)))
+			if hasattr(lt.settings_pack, 'active_downloads'):
+				set_int(lt.settings_pack.active_downloads, 2000)
+			if hasattr(lt.settings_pack, 'active_seeds'):
+				set_int(lt.settings_pack.active_seeds, 2000)
+			if hasattr(lt.settings_pack, 'active_limit'):
+				set_int(lt.settings_pack.active_limit, 4000)
+			if hasattr(lt.settings_pack, 'unchoke_slots_limit'):
+				set_int(lt.settings_pack.unchoke_slots_limit, -1)  # unlimited
+			if hasattr(lt.settings_pack, 'request_timeout'):
+				set_int(lt.settings_pack.request_timeout, 12)
+			if hasattr(lt.settings_pack, 'request_queue_time'):
+				set_int(lt.settings_pack.request_queue_time, 4)
+			if hasattr(lt.settings_pack, 'max_allowed_in_request_queue'):
+				set_int(lt.settings_pack.max_allowed_in_request_queue, 20000)
+			if hasattr(lt.settings_pack, 'max_out_request_queue'):
+				set_int(lt.settings_pack.max_out_request_queue, 5000)
+			if hasattr(lt.settings_pack, 'whole_pieces_threshold'):
+				set_int(lt.settings_pack.whole_pieces_threshold, 16)
+			if hasattr(lt.settings_pack, 'allow_multiple_connections_per_ip'):
+				set_bool(lt.settings_pack.allow_multiple_connections_per_ip, True)
+			if hasattr(lt.settings_pack, 'piece_extent_affinity'):
+				set_bool(lt.settings_pack.piece_extent_affinity, True)
+
+			# Disk and I/O (bigger buffers)
+			if hasattr(lt.settings_pack, 'max_queued_disk_bytes'):
+				set_int(lt.settings_pack.max_queued_disk_bytes, 1024 * 1024 * 1024)
+			if hasattr(lt.settings_pack, 'max_queued_disk_bytes_low_watermark'):
+				set_int(lt.settings_pack.max_queued_disk_bytes_low_watermark, 512 * 1024 * 1024)
+			if hasattr(lt.settings_pack, 'aio_threads'):
+				set_int(lt.settings_pack.aio_threads, 32)
+			if hasattr(lt.settings_pack, 'file_pool_size'):
+				set_int(lt.settings_pack.file_pool_size, 40000)
+			if hasattr(lt.settings_pack, 'checking_mem_usage'):
+				set_int(lt.settings_pack.checking_mem_usage, 8192)
+			if hasattr(lt.settings_pack, 'coalesce_writes'):
+				set_bool(lt.settings_pack.coalesce_writes, True)
+			if hasattr(lt.settings_pack, 'coalesce_reads'):
+				set_bool(lt.settings_pack.coalesce_reads, True)
+			if hasattr(lt.settings_pack, 'send_buffer_watermark'):
+				set_int(lt.settings_pack.send_buffer_watermark, 20 * 1024 * 1024)
+			if hasattr(lt.settings_pack, 'send_buffer_low_watermark'):
+				set_int(lt.settings_pack.send_buffer_low_watermark, 1 * 1024 * 1024)
+			if hasattr(lt.settings_pack, 'send_buffer_watermark_factor'):
+				set_int(lt.settings_pack.send_buffer_watermark_factor, 300)
+			if hasattr(lt.settings_pack, 'mixed_mode_algorithm'):
+				set_int(lt.settings_pack.mixed_mode_algorithm, getattr(lt.settings_pack, 'prefer_tcp', 0))
+			if hasattr(lt.settings_pack, 'recv_socket_buffer_size'):
+				set_int(lt.settings_pack.recv_socket_buffer_size, 8 * 1024 * 1024)
+			if hasattr(lt.settings_pack, 'send_socket_buffer_size'):
+				set_int(lt.settings_pack.send_socket_buffer_size, 8 * 1024 * 1024)
+
+			# Protocol
+			if hasattr(lt.settings_pack, 'enable_outgoing_utp'):
+				set_bool(lt.settings_pack.enable_outgoing_utp, True)
+			if hasattr(lt.settings_pack, 'enable_incoming_utp'):
+				set_bool(lt.settings_pack.enable_incoming_utp, True)
+			if hasattr(lt.settings_pack, 'enable_outgoing_tcp'):
+				set_bool(lt.settings_pack.enable_outgoing_tcp, True)
+			if hasattr(lt.settings_pack, 'enable_incoming_tcp'):
+				set_bool(lt.settings_pack.enable_incoming_tcp, True)
+			if hasattr(lt.settings_pack, 'prefer_rc4'):
+				set_bool(lt.settings_pack.prefer_rc4, False)
+			if hasattr(lt.settings_pack, 'rate_limit_utp'):
+				set_bool(lt.settings_pack.rate_limit_utp, False)
+			if hasattr(lt.settings_pack, 'enable_upnp'):
+				set_bool(lt.settings_pack.enable_upnp, True)
+			if hasattr(lt.settings_pack, 'enable_natpmp'):
+				set_bool(lt.settings_pack.enable_natpmp, True)
+			if hasattr(lt.settings_pack, 'enable_lsd'):
+				set_bool(lt.settings_pack.enable_lsd, True)
+
+			# Choking, suggestions
+			if hasattr(lt.settings_pack, 'choking_algorithm'):
+				set_int(lt.settings_pack.choking_algorithm, getattr(lt.settings_pack, 'fixed_slots_choker', 0))
+			if hasattr(lt.settings_pack, 'seed_choking_algorithm'):
+				set_int(lt.settings_pack.seed_choking_algorithm, getattr(lt.settings_pack, 'round_robin', 0))
+			if hasattr(lt.settings_pack, 'suggest_mode'):
+				set_int(lt.settings_pack.suggest_mode, getattr(lt.settings_pack, 'suggest_read_cache', getattr(lt.settings_pack, 'auto_suggest', 0)))
+
+			self.session.apply_settings(sp)
+		except Exception as e:
+			logger.warning(f"Speed tuning apply failed: {e}")
+
 	def setup_gui(self):
 		self.root.title("Advanced BitTorrent Client")
-		self.root.geometry("1380x920")
+		self.root.geometry("1420x980")
 		self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+		try:
+			alpha = float(self.config.get('window_transparency', 1.0))
+			alpha = min(max(alpha, 0.5), 1.0)
+			self.root.attributes('-alpha', alpha)
+		except Exception:
+			pass
 
 		self.create_menu()
 		self.create_toolbar()
@@ -226,7 +330,113 @@ class TorrentClient:
 		except Exception:
 			pass
 
+		self.apply_theme(self.config.get('theme', 'light'), self.config.get('background_image_path', None))
 		self.center_window()
+
+	def apply_theme(self, theme: str, bg_image_path: str = None):
+		try:
+			# Palettes
+			if theme == 'tokyo-night':
+				bg = "#1a1b26"
+				fg = "#c0caf5"
+				accent = "#7aa2f7"
+				sbg = "#24283b"
+				hbg = "#292e42"
+			elif theme == 'dark':
+				bg = "#121212"
+				fg = "#e8e8e8"
+				accent = "#3d7eff"
+				sbg = "#1e1e1e"
+				hbg = "#232323"
+			else:  # light
+				bg = "#fafafa"
+				fg = "#1f1f1f"
+				accent = "#1e5eff"
+				sbg = "#ffffff"
+				hbg = "#f0f0f0"
+
+			style = ttk.Style()
+			self.root.configure(bg=bg)
+			self.root.option_clear()
+			self.root.option_add("*TFrame.background", bg)
+			self.root.option_add("*TLabel.background", bg)
+			self.root.option_add("*TLabel.foreground", fg)
+			self.root.option_add("*TButton.foreground", fg)
+			self.root.option_add("*TButton.background", sbg)
+
+			style.configure("TFrame", background=bg)
+			style.configure("TLabel", background=bg, foreground=fg)
+			style.configure("TButton", background=sbg, foreground=fg)
+			style.map("TButton", background=[("active", hbg)])
+			style.configure("Treeview", background=sbg, fieldbackground=sbg, foreground=fg)
+			style.configure("TNotebook", background=bg)
+			style.configure("TNotebook.Tab", background=hbg, foreground=fg)
+			style.map("TNotebook.Tab", background=[("selected", sbg)])
+
+			# Text widgets need manual colors
+			for w in getattr(self, "_text_widgets", []):
+				try:
+					w.configure(bg=sbg, fg=fg, insertbackground=fg)
+				except Exception:
+					pass
+
+			# Background image (optional)
+			self.set_background_image(bg_image_path if bg_image_path else self.config.get('background_image_path', None))
+		except Exception:
+			pass
+
+	def set_background_image(self, path: str | None):
+		try:
+			# Remove if not set
+			if not path or not Path(path).exists():
+				if self._bg_label:
+					self._bg_label.destroy()
+					self._bg_label = None
+					self._bg_image_obj = None
+				return
+			from PIL import Image, ImageTk  # pillow optional
+			img = Image.open(path)
+			w = self.root.winfo_width() or 1200
+			h = self.root.winfo_height() or 800
+			img = img.resize((w, h), Image.LANCZOS)
+			self._bg_image_obj = ImageTk.PhotoImage(img)
+			if not self._bg_label:
+				self._bg_label = tk.Label(self.root, image=self._bg_image_obj, borderwidth=0, highlightthickness=0)
+				self._bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+				self._bg_label.lower()
+			else:
+				self._bg_label.configure(image=self._bg_image_obj)
+			# Keep image updated on resize
+			def _on_resize(_evt):
+				try:
+					img2 = Image.open(path).resize((self.root.winfo_width(), self.root.winfo_height()), Image.LANCZOS)
+					self._bg_image_obj = ImageTk.PhotoImage(img2)
+					self._bg_label.configure(image=self._bg_image_obj)
+				except Exception:
+					pass
+			self.root.bind('<Configure>', _on_resize)
+		except Exception:
+			# Pillow not installed or failed; ignore background image
+			if self._bg_label:
+				self._bg_label.destroy()
+				self._bg_label = None
+				self._bg_image_obj = None
+
+	def set_theme(self, theme: str):
+		self.config['theme'] = theme
+		self.save_config()
+		self.apply_theme(theme, self.config.get('background_image_path', None))
+
+	def choose_background_image(self):
+		path = filedialog.askopenfilename(
+			title="Choose Background Image",
+			filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"), ("All files", "*.*")]
+		)
+		if not path:
+			return
+		self.config['background_image_path'] = path
+		self.save_config()
+		self.apply_theme(self.config.get('theme', 'light'), path)
 
 	def center_window(self):
 		self.root.update_idletasks()
@@ -261,11 +471,22 @@ class TorrentClient:
 		view_menu = tk.Menu(menubar, tearoff=0)
 		menubar.add_cascade(label="View", menu=view_menu)
 		self.hide_completed_var = tk.BooleanVar(value=False)
-		self.live_status_var = tk.BooleanVar(value=True)  # show single-line live status
+		self.live_status_var = tk.BooleanVar(value=True)
 		view_menu.add_checkbutton(label="Hide Completed/Seeding", variable=self.hide_completed_var, command=self.refresh_filter_view)
 		view_menu.add_checkbutton(label="Show Live Status Panel", variable=self.live_status_var, command=self.toggle_live_status_panel)
+		theme_menu = tk.Menu(view_menu, tearoff=0)
+		view_menu.add_cascade(label="Theme", menu=theme_menu)
+		self.theme_var = tk.StringVar(value=self.config.get('theme', 'light'))
+		theme_menu.add_radiobutton(label="Light", variable=self.theme_var, value='light', command=lambda: self.set_theme('light'))
+		theme_menu.add_radiobutton(label="Dark", variable=self.theme_var, value='dark', command=lambda: self.set_theme('dark'))
+		theme_menu.add_radiobutton(label="Tokyo Night", variable=self.theme_var, value='tokyo-night', command=lambda: self.set_theme('tokyo-night'))
+		theme_menu.add_separator()
+		theme_menu.add_command(label="Choose Background Image...", command=self.choose_background_image)
+		view_menu.add_separator()
 		view_menu.add_command(label="Show Performance Graph", command=self.show_performance_graph)
 		view_menu.add_command(label="Show Download History", command=self.show_download_history)
+		view_menu.add_separator()
+		view_menu.add_command(label="Clear All Logs", command=self.clear_all_logs)
 
 		torrent_menu = tk.Menu(menubar, tearoff=0)
 		menubar.add_cascade(label="Torrent", menu=torrent_menu)
@@ -276,6 +497,9 @@ class TorrentClient:
 		torrent_menu.add_separator()
 		torrent_menu.add_command(label="Remove", command=self.remove_selected, accelerator="Delete")
 		torrent_menu.add_command(label="Remove and Delete Data", command=self.remove_and_delete_selected)
+		torrent_menu.add_separator()
+		torrent_menu.add_command(label="Move Storage...", command=self.move_storage_selected)
+		torrent_menu.add_separator()
 		torrent_menu.add_command(label="Open Folder", command=self.open_folder)
 		torrent_menu.add_command(label="Open File Location", command=self.open_file_location)
 		torrent_menu.add_separator()
@@ -283,6 +507,7 @@ class TorrentClient:
 		torrent_menu.add_command(label="Force Reannounce", command=self.force_reannounce)
 		torrent_menu.add_separator()
 		torrent_menu.add_command(label="Copy Magnet Link", command=self.copy_magnet_link)
+		torrent_menu.add_command(label="Copy Info Hash", command=self.copy_info_hash)
 		torrent_menu.add_command(label="Save As", command=self.save_as_selected)
 
 		help_menu = tk.Menu(menubar, tearoff=0)
@@ -331,7 +556,7 @@ class TorrentClient:
 		search_frame.pack(side=tk.RIGHT)
 		ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 5))
 		self.search_var = tk.StringVar()
-		search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=26)
+		search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=28)
 		search_entry.pack(side=tk.LEFT)
 		search_entry.bind('<KeyRelease>', self.filter_torrents)
 
@@ -346,9 +571,9 @@ class TorrentClient:
 		tree_frame.pack(fill=tk.BOTH, expand=True)
 
 		columns = ('Name', 'Size', 'Progress', 'Status', 'Seeds', 'Peers', 'Down Speed', 'Up Speed', 'ETA', 'Ratio', 'Added On')
-		self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=22)
+		self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=24)
 
-		column_widths = [400, 120, 90, 120, 80, 80, 120, 120, 90, 80, 170]
+		column_widths = [420, 130, 100, 130, 80, 80, 130, 130, 100, 80, 190]
 		for i, (col, width) in enumerate(zip(columns, column_widths)):
 			self.tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(c))
 			self.tree.column(col, width=width, anchor='center' if i > 0 else 'w')
@@ -412,7 +637,7 @@ class TorrentClient:
 		self.files_tree = ttk.Treeview(files_frame, columns=files_columns, show='tree headings')
 		for col in files_columns:
 			self.files_tree.heading(col, text=col)
-			self.files_tree.column(col, width=220 if col == 'File' else 160)
+			self.files_tree.column(col, width=240 if col == 'File' else 160)
 
 		files_v_scroll = ttk.Scrollbar(files_frame, orient=tk.VERTICAL, command=self.files_tree.yview)
 		files_h_scroll = ttk.Scrollbar(files_frame, orient=tk.HORIZONTAL, command=self.files_tree.xview)
@@ -429,7 +654,7 @@ class TorrentClient:
 		self.peers_tree = ttk.Treeview(self.peers_frame, columns=peers_columns, show='headings')
 		for col in peers_columns:
 			self.peers_tree.heading(col, text=col)
-			self.peers_tree.column(col, width=160)
+			self.peers_tree.column(col, width=170)
 		peers_scroll = ttk.Scrollbar(self.peers_frame, orient=tk.VERTICAL, command=self.peers_tree.yview)
 		self.peers_tree.configure(yscrollcommand=peers_scroll.set)
 		self.peers_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -440,7 +665,7 @@ class TorrentClient:
 		self.trackers_tree = ttk.Treeview(self.trackers_frame, columns=trackers_columns, show='headings')
 		for col in trackers_columns:
 			self.trackers_tree.heading(col, text=col)
-			self.trackers_tree.column(col, width=400 if col == 'URL' else 400)
+			self.trackers_tree.column(col, width=420 if col == 'URL' else 420)
 		trackers_scroll = ttk.Scrollbar(self.trackers_frame, orient=tk.VERTICAL, command=self.trackers_tree.yview)
 		self.trackers_tree.configure(yscrollcommand=trackers_scroll.set)
 		self.trackers_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -467,10 +692,14 @@ class TorrentClient:
 
 		live_controls = ttk.Frame(right)
 		live_controls.pack(fill=tk.X, pady=(0, 5))
-		ttk.Label(live_controls, text="Live Status (one line per torrent)").pack(side=tk.LEFT)
+		ttk.Label(live_controls, text="Live Status (one line per torrent) - Right-click for actions").pack(side=tk.LEFT)
 		self.live_status_text = scrolledtext.ScrolledText(right, height=14, wrap=tk.NONE)
 		self.live_status_text.pack(fill=tk.BOTH, expand=True)
 		self.live_status_text.config(state=tk.DISABLED)
+		self.live_status_text.bind('<Button-3>', self.show_live_status_context_menu)
+
+		self._text_widgets = [self.log_text, self.live_status_text]
+		self.apply_theme(self.config.get('theme', 'light'), self.config.get('background_image_path', None))
 
 	def toggle_live_status_panel(self):
 		visible = self.live_status_var.get()
@@ -517,6 +746,8 @@ class TorrentClient:
 		self.perf_text = scrolledtext.ScrolledText(perf_frame, height=12, wrap=tk.WORD)
 		self.perf_text.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 		self.perf_text.config(state=tk.DISABLED)
+		self._text_widgets.append(self.perf_text)
+		self.apply_theme(self.config.get('theme', 'light'), self.config.get('background_image_path', None))
 
 	def create_status_bar(self):
 		self.status_bar = ttk.Frame(self.root)
@@ -531,7 +762,20 @@ class TorrentClient:
 		self.speed_label.pack(side=tk.RIGHT, padx=(5, 0))
 
 	def ask_fast_download_options(self):
+		# Bypass prompt if configured, but we still honor per-torrent popup later
+		if self.config.get('fast_download_prompt', True) is False:
+			return {
+				'enabled': self.config.get('fast_download_default_enabled', True),
+				'connections': self.config.get('fast_download_default_connections', 20),
+				'sequential': self.config.get('fast_download_sequential', True)
+			}
 		return FastDownloadDialog(self.root, self.config).result
+
+	def ask_preselect_choice(self, default=True):
+		# Always show selection if configured
+		if self.config.get('preselect_always', True):
+			return True
+		return PreSelectChoiceDialog(self.root, default).result
 
 	def add_torrent_files(self):
 		paths = filedialog.askopenfilenames(
@@ -541,11 +785,13 @@ class TorrentClient:
 		)
 		if not paths:
 			return
+		# Always preselect to prevent auto-start before choosing files
+		preselect = True
 		fd = self.ask_fast_download_options()
 		default_save = self.config.get('download_path', str(platform_downloads_dir()))
 		for file_path in paths:
 			try:
-				self.add_torrent(file_path, default_save, fast_download=fd)
+				self.add_torrent(file_path, default_save, fast_download=fd, preselect_files=preselect)
 			except Exception as e:
 				self.log(f"Failed adding {file_path}: {e}")
 		self.config['last_opened_torrent_dir'] = str(Path(paths[-1]).parent)
@@ -555,8 +801,9 @@ class TorrentClient:
 		dialog = MagnetDialog(self.root, self.config.get('download_path', str(platform_downloads_dir())))
 		magnet_uri, save_path = dialog.result if dialog.result else (None, None)
 		if magnet_uri and save_path:
+			preselect = True
 			fd = self.ask_fast_download_options()
-			self.add_torrent(magnet_uri, save_path, fast_download=fd)
+			self.add_torrent(magnet_uri, save_path, fast_download=fd, preselect_files=preselect)
 
 	def add_multi_magnets_dialog(self):
 		dialog = MultiMagnetDialog(self.root, self.config.get('download_path', str(platform_downloads_dir())))
@@ -564,10 +811,11 @@ class TorrentClient:
 		if not result:
 			return
 		save_path, magnets = result
+		preselect = True
 		fd = self.ask_fast_download_options()
 		for m in magnets:
 			try:
-				self.add_torrent(m, save_path, fast_download=fd)
+				self.add_torrent(m, save_path, fast_download=fd, preselect_files=preselect)
 			except Exception as e:
 				self.log(f"Add magnet failed: {e}")
 
@@ -575,17 +823,18 @@ class TorrentClient:
 		dialog = UrlDialog(self.root, self.config.get('download_path', str(platform_downloads_dir())))
 		url, save_path = dialog.result if dialog.result else (None, None)
 		if url and save_path:
+			preselect = True
 			fd = self.ask_fast_download_options()
-			self.download_torrent_from_url(url, save_path, fast_download=fd)
+			self.download_torrent_from_url(url, save_path, fast_download=fd, preselect_files=preselect)
 
-	def download_torrent_from_url(self, url, save_path, fast_download=None):
+	def download_torrent_from_url(self, url, save_path, fast_download=None, preselect_files=True):
 		try:
 			self.log(f"Downloading torrent from URL: {url}")
 			r = requests.get(url, timeout=30)
 			r.raise_for_status()
 			tmp = Path(f"temp_{int(time.time())}.torrent")
 			tmp.write_bytes(r.content)
-			self.add_torrent(str(tmp), save_path, fast_download=fast_download)
+			self.add_torrent(str(tmp), save_path, fast_download=fast_download, preselect_files=preselect_files)
 			threading.Timer(5.0, lambda: tmp.exists() and tmp.unlink()).start()
 		except Exception as e:
 			messagebox.showerror("Error", f"Failed to download/add torrent: {e}")
@@ -593,43 +842,93 @@ class TorrentClient:
 
 	def apply_fast_download(self, handle, fast_download):
 		try:
-			if not fast_download or not fast_download.get('enabled', False):
-				return
-			connections = int(fast_download.get('connections', 5))
-			# Approximate multi-connection acceleration:
-			# - raise per-torrent peer limit
-			# - enable sequential if requested (default True for "fast download")
+			# Ultra-aggressive per-torrent tuning, but DO NOT resume here
 			if lt_has(handle, 'set_max_connections'):
-				handle.set_max_connections(max(20, connections * 50))
-			if fast_download.get('sequential', True) and lt_has(handle, 'set_sequential_download'):
-				handle.set_sequential_download(True)
-			# remove upload-only if present
+				handle.set_max_connections(4000)
+			if lt_has(handle, 'set_max_uploads'):
+				handle.set_max_uploads(2000)
+			if lt_has(handle, 'set_download_limit'):
+				handle.set_download_limit(0)  # unlimited
+			if lt_has(handle, 'set_upload_limit'):
+				handle.set_upload_limit(0)  # unlimited
+			if lt_has(handle, 'set_sequential_download'):
+				handle.set_sequential_download(bool(self.config.get('fast_download_sequential', True)))
+
+			# user fast settings overlay
+			if fast_download and fast_download.get('enabled', False):
+				connections = int(fast_download.get('connections', 20))
+				if lt_has(handle, 'set_max_connections'):
+					handle.set_max_connections(max(200, connections * 300))
+				if lt_has(handle, 'set_max_uploads'):
+					handle.set_max_uploads(max(100, connections * 60))
+				if fast_download.get('sequential', True) and lt_has(handle, 'set_sequential_download'):
+					handle.set_sequential_download(True)
+
 			if lt_has(handle, 'set_upload_mode'):
 				handle.set_upload_mode(False)
 		except Exception:
 			pass
 
-	def add_torrent(self, torrent_source, save_path=None, fast_download=None):
+	def add_torrent(self, torrent_source, save_path=None, fast_download=None, preselect_files=True):
 		if save_path is None:
 			save_path = self.config.get('download_path', str(platform_downloads_dir()))
 		Path(save_path).mkdir(parents=True, exist_ok=True)
 
 		if str(torrent_source).startswith("magnet:"):
-			handle = lt.add_magnet_uri(self.session, torrent_source, {'save_path': save_path})
+			# Add paused to allow preselection after metadata arrives
+			params = lt.add_torrent_params()
+			params.save_path = save_path
+			params.url = torrent_source
+			try:
+				flags_base = getattr(lt, 'torrent_flags', None)
+				paused_flag = getattr(flags_base, 'paused', 0) if flags_base else 0
+				auto_managed_flag = getattr(flags_base, 'auto_managed', 0) if flags_base else 0
+				current_flags = getattr(params, 'flags', 0)
+				# paused and not auto-managed to prevent libtorrent from auto starting
+				params.flags = (current_flags | paused_flag) & (~auto_managed_flag if auto_managed_flag else -1)
+			except Exception:
+				pass
+			handle = self.session.add_torrent(params)
+			# hard pause safeguard
+			try: handle.pause()
+			except Exception: pass
 			source_type = 'magnet'
 			name_hint = torrent_source[:64] + "..."
 		else:
 			info = lt.torrent_info(torrent_source)
-			params = {
-				'ti': info,
-				'save_path': save_path,
-				'storage_mode': lt.storage_mode_t.storage_mode_sparse
-			}
-			handle = self.session.add_torrent(params)
+			# Start paused so we can preselect
+			try:
+				atp = lt.add_torrent_params()
+				atp.ti = info
+				atp.save_path = save_path
+				try:
+					flags_base = getattr(lt, 'torrent_flags', None)
+					paused_flag = getattr(flags_base, 'paused', 0) if flags_base else 0
+					auto_managed_flag = getattr(flags_base, 'auto_managed', 0) if flags_base else 0
+					current_flags = getattr(atp, 'flags', 0)
+					atp.flags = (current_flags | paused_flag) & (~auto_managed_flag if auto_managed_flag else -1)
+				except Exception:
+					pass
+				handle = self.session.add_torrent(atp)
+			except Exception:
+				params = {
+					'ti': info,
+					'save_path': save_path,
+					'storage_mode': lt.storage_mode_t.storage_mode_sparse if hasattr(lt, 'storage_mode_t') else 0
+				}
+				handle = self.session.add_torrent(params)
+				try: handle.pause()
+				except Exception: pass
+			# hard pause safeguard
+			try: handle.pause()
+			except Exception: pass
 			source_type = 'file'
 			name_hint = info.name()
 
+		# apply speed tweaks but remain paused
 		self.apply_fast_download(handle, fast_download)
+		try: handle.pause()
+		except Exception: pass
 
 		t_hash = safe_info_hash_str(handle)
 		if t_hash in self.torrents:
@@ -658,6 +957,148 @@ class TorrentClient:
 			'save_path': save_path
 		})
 
+		# Always do preselection to prevent auto-download of unwanted files
+		if preselect_files:
+			if str(torrent_source).startswith("magnet:"):
+				# Wait for metadata then open selectors, then per-torrent speed popup, then resume
+				threading.Thread(target=self._wait_and_preselect_for_magnet, args=(handle, t_hash, fast_download), daemon=True).start()
+			else:
+				try:
+					ti = handle.get_torrent_info()
+					self._run_selection_chain(handle, ti, fast_download)
+				except Exception:
+					threading.Thread(target=self._wait_and_preselect_for_magnet, args=(handle, t_hash, fast_download), daemon=True).start()
+		else:
+			# Even if preselect disabled, keep paused until user explicitly starts
+			self.log("Added paused. Use Start to begin downloading.")
+			try: handle.pause()
+			except Exception: pass
+
+	def _wait_and_preselect_for_magnet(self, handle, t_hash, fast_download):
+		try:
+			self.log("Waiting for metadata...")
+			start = time.time()
+			while True:
+				st = handle.status()
+				if getattr(st, 'has_metadata', False):
+					break
+				if not self.running:
+					return
+				if time.time() - start > 300:
+					self.log("Metadata timeout; staying paused.")
+					try:
+						handle.pause()
+					except Exception:
+						pass
+					return
+				time.sleep(0.2)
+			ti = handle.get_torrent_info()
+			self.root.after(0, lambda: self._run_selection_chain(handle, ti, fast_download))
+		except Exception as e:
+			self.log(f"Preselection wait error: {e}")
+			try:
+				handle.pause()
+			except Exception:
+				pass
+
+	def _run_selection_chain(self, handle, torrent_info, fast_download):
+		# Ensure paused before dialogs
+		try: handle.pause()
+		except Exception: pass
+		# Tree selection dialog
+		dialog = PreFileSelectDialog(self.root, torrent_info)
+		selection = dialog.result  # None or list of selected indices
+		if selection is None:
+			self.log("File selection canceled; staying paused.")
+			return
+		# Quick pick dialog
+		quick = QuickPickDialog(self.root, torrent_info, selection)
+		choice = quick.result
+		if choice is None:
+			self.log("Quick pick canceled; staying paused.")
+			return
+
+		# Apply file priorities according to choice
+		try:
+			num_files = torrent_info.num_files()
+			priorities = [FILE_PRIORITY_SKIP] * num_files
+			if choice['mode'] == 'all':
+				priorities = [FILE_PRIORITY_NORMAL] * num_files
+			elif choice['mode'] == 'largest':
+				files = torrent_info.files()
+				largest_idx = 0
+				max_size = -1
+				for i in range(num_files):
+					try:
+						sz = files.file_size(i)
+					except Exception:
+						sz = 0
+					if sz > max_size:
+						max_size = sz
+						largest_idx = i
+				priorities[largest_idx] = FILE_PRIORITY_MAX
+			elif choice['mode'] == 'selected':
+				selected = choice.get('selected') or []
+				if not selected:
+					selected = list(range(num_files))
+				for idx in selected:
+					if 0 <= idx < num_files:
+						priorities[idx] = FILE_PRIORITY_NORMAL
+
+			try:
+				handle.prioritize_files(priorities)
+			except Exception:
+				for i, pr in enumerate(priorities):
+					try:
+						handle.file_priority(i, pr)
+					except Exception:
+						pass
+
+			# prioritize first/last pieces for faster preview
+			try:
+				num_pieces = torrent_info.num_pieces()
+				if num_pieces > 0 and lt_has(handle, 'prioritize_pieces'):
+					pp = [1] * num_pieces
+					pp[0] = 7
+					pp[-1] = 7
+					handle.prioritize_pieces(pp)
+			except Exception:
+				pass
+
+			self.log(f"Applied file selection (mode='{choice['mode']}').")
+		except Exception as e:
+			self.log(f"File selection apply error: {e}")
+
+		# Per-torrent speed/connection dialog (multi-connection popup)
+		try:
+			per_t = PerTorrentSpeedDialog(self.root, handle)
+			pt_res = per_t.result
+			if pt_res:
+				try:
+					if lt_has(handle, 'set_max_connections'):
+						handle.set_max_connections(int(pt_res.get('connections', 1000)))
+					if lt_has(handle, 'set_max_uploads'):
+						handle.set_max_uploads(int(pt_res.get('uploads', 500)))
+					if lt_has(handle, 'set_download_limit'):
+						handle.set_download_limit(max(0, int(pt_res.get('dl_limit', 0))))
+					if lt_has(handle, 'set_upload_limit'):
+						handle.set_upload_limit(max(0, int(pt_res.get('ul_limit', 0))))
+					if lt_has(handle, 'set_sequential_download'):
+						handle.set_sequential_download(bool(pt_res.get('sequential', True)))
+				except Exception as e:
+					self.log(f"Per-torrent speed apply error: {e}")
+		except Exception:
+			pass
+
+		# Finally resume/download only what was selected
+		try:
+			if lt_has(handle, 'set_upload_mode'):
+				handle.set_upload_mode(False)
+			handle.resume()
+			self.log("Started download with selected files only.")
+		except Exception as e:
+			self.log(f"Start after selection error: {e}")
+
 	def update_torrents_loop(self):
 		while self.running:
 			try:
@@ -678,7 +1119,7 @@ class TorrentClient:
 			self.update_status_bar()
 			self.update_performance_stats()
 			self.auto_move_completed()
-			self.update_live_status()  # single-line per torrent
+			self.update_live_status()
 			if self.hide_completed_var.get():
 				self.refresh_filter_view()
 		except Exception as e:
@@ -1075,11 +1516,12 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		now = time.time()
 		if not self.live_status_var.get():
 			return
-		# throttle to ~2Hz
 		if now - self._last_live_status_render < 0.5:
 			return
 		self._last_live_status_render = now
 		lines = []
+		line_map = {}
+		line_no = 1
 		for hsh, info in self.torrents.items():
 			h = info['handle']
 			try:
@@ -1090,8 +1532,11 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 				ds = self.format_speed(getattr(st, 'download_rate', 0))
 				us = self.format_speed(getattr(st, 'upload_rate', 0))
 				lines.append(f"{name} | {prog} | {state} | ↓ {ds} ↑ {us}")
+				line_map[line_no] = hsh
+				line_no += 1
 			except Exception:
 				continue
+		self._live_status_line_to_hash = line_map
 		try:
 			self.live_status_text.config(state=tk.NORMAL)
 			self.live_status_text.delete(1.0, tk.END)
@@ -1101,6 +1546,7 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 			pass
 
 	def auto_move_completed(self):
+		# Completed path root
 		completed_root = Path(self.config.get('completed_path', str(platform_downloads_dir() / "Completed")))
 		try:
 			completed_root.mkdir(parents=True, exist_ok=True)
@@ -1112,23 +1558,38 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 				st = handle.status()
 				is_done = getattr(st, 'is_seeding', False) or getattr(st, 'state', None) == lt.torrent_status.seeding or getattr(st, 'progress', 0.0) >= 0.999
 				if is_done and not info.get('moved', False):
-					src = Path(getattr(st, 'save_path', info['save_path']))
+					base_save_path = Path(getattr(st, 'save_path', info['save_path'])).resolve()
+					# If completed_root is the same as base_save_path or inside it, skip auto move to avoid self-move
+					try:
+						if completed_root.resolve() == base_save_path or str(completed_root.resolve()).startswith(str((base_save_path / '').resolve())):
+							self.log("Auto-move skipped: Completed path is within save path.")
+							info['moved'] = True
+							continue
+					except Exception:
+						pass
 					name = getattr(st, 'name', None) or (handle.name() if lt_has(handle, 'name') else hsh)
 					if not name:
 						continue
-					src_content = src / name
-					target = completed_root / name
+					src_content = (base_save_path / name).resolve()
+					target = (completed_root / name).resolve()
+
+					# Only move the content (never the base save folder)
+					if not src_content.exists():
+						# Nothing concrete to move yet; skip
+						continue
+
+					# Prevent moving a directory into itself
 					try:
-						if src_content.exists():
-							if src_content.is_dir():
-								shutil.move(str(src_content), str(target))
-							else:
-								target.parent.mkdir(parents=True, exist_ok=True)
-								shutil.move(str(src_content), str(target))
-						elif src.exists():
-							shutil.move(str(src), str(target))
-						else:
+						if str(target).startswith(str(src_content)):
+							self.log("Auto-move skipped: target would be inside source.")
+							info['moved'] = True
 							continue
+					except Exception:
+						pass
+
+					try:
+						target.parent.mkdir(parents=True, exist_ok=True)
+						shutil.move(str(src_content), str(target))
 						info['moved'] = True
 						self.log(f"Auto-moved completed to: {target}")
 					except Exception as me:
@@ -1408,6 +1869,38 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		except Exception as e:
 			self.log(f"Copy magnet error: {e}")
 
+	def copy_info_hash(self):
+		item = self.get_single_selection()
+		if not item:
+			return
+		h = self.get_handle_from_item(item)
+		if not h:
+			return
+		try:
+			ih = safe_info_hash_str(h)
+			self.root.clipboard_clear()
+			self.root.clipboard_append(ih)
+			self.log(f"Info hash copied: {ih}")
+		except Exception as e:
+			self.log(f"Copy hash error: {e}")
+
+	def move_storage_selected(self):
+		item = self.get_single_selection()
+		if not item:
+			return
+		h = self.get_handle_from_item(item)
+		if not h:
+			return
+		new_path = filedialog.askdirectory(initialdir=self.config.get('download_path', str(platform_downloads_dir())))
+		if not new_path:
+			return
+		try:
+			h.move_storage(new_path)
+			self.log(f"Move storage requested to: {new_path}")
+		except Exception as e:
+			self.log(f"Move storage error: {e}")
+			messagebox.showerror("Move Storage", str(e))
+
 	def get_single_selection(self):
 		sel = self.tree.selection()
 		if not sel:
@@ -1486,6 +1979,9 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 			menu.add_separator()
 			menu.add_command(label="Remove", command=self.remove_selected)
 			menu.add_command(label="Remove + Data", command=self.remove_and_delete_selected)
+			menu.add_separator()
+			menu.add_command(label="Move Storage...", command=self.move_storage_selected)
+			menu.add_separator()
 			menu.add_command(label="Open Folder", command=self.open_folder)
 			menu.add_command(label="Open File Location", command=self.open_file_location)
 			menu.add_separator()
@@ -1493,23 +1989,95 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 			menu.add_command(label="Force Reannounce", command=self.force_reannounce)
 			menu.add_separator()
 			menu.add_command(label="Copy Magnet Link", command=self.copy_magnet_link)
+			menu.add_command(label="Copy Info Hash", command=self.copy_info_hash)
 			menu.add_command(label="Save As", command=self.save_as_selected)
 			menu.tk_popup(event.x_root, event.y_root)
 
 	def on_torrent_double_click(self, event):
 		self.open_folder()
 
+	def show_live_status_context_menu(self, event):
+		try:
+			index = self.live_status_text.index(f"@{event.x},{event.y}")
+			line_str = index.split('.')[0]
+			line_no = int(line_str)
+		except Exception:
+			return
+		t_hash = self._live_status_line_to_hash.get(line_no)
+		if not t_hash:
+			return
+		menu = tk.Menu(self.root, tearoff=0)
+		menu.add_command(label="Stop (halt seeding/downloading)", command=lambda: self.live_stop_torrent_by_hash(t_hash))
+		menu.add_separator()
+		menu.add_command(label="Remove (keep data)", command=lambda: self.live_remove_torrent_by_hash(t_hash, delete_data=False))
+		menu.add_command(label="Remove + Delete Data", command=lambda: self.live_remove_torrent_by_hash(t_hash, delete_data=True))
+		menu.add_separator()
+		menu.add_command(label="Delete Logs (Live + Log)", command=self.clear_all_logs)
+		menu.add_command(label="Clear All Logs (Main)", command=self.clear_all_logs)
+		menu.tk_popup(event.x_root, event.y_root)
+
+	def live_stop_torrent_by_hash(self, t_hash):
+		info = self.torrents.get(t_hash)
+		if not info:
+			return
+		h = info.get('handle')
+		if not h:
+			return
+		try:
+			if lt_has(h, 'set_upload_mode'):
+				h.set_upload_mode(True)
+			h.pause()
+			self.log(f"Stopped: {getattr(h.status(), 'name', '') or (h.name() if lt_has(h, 'name') else t_hash[:10])}")
+		except Exception as e:
+			self.log(f"Stop error: {e}")
+
+	def live_remove_torrent_by_hash(self, t_hash, delete_data=False):
+		info = self.torrents.get(t_hash)
+		if not info:
+			return
+		h = info.get('handle')
+		if not h:
+			return
+		try:
+			if delete_data:
+				try:
+					flag = getattr(getattr(lt, 'options_t', object()), 'delete_files', 1)
+					self.session.remove_torrent(h, flag)
+				except Exception:
+					self.session.remove_torrent(h)
+			else:
+				self.session.remove_torrent(h)
+			for item in self.tree.get_children():
+				tags = self.tree.item(item)['tags']
+				if tags and tags[0] == t_hash:
+					self.tree.delete(item)
+					break
+			self.torrents.pop(t_hash, None)
+			self.log("Removed via Live menu" + (" and data" if delete_data else ""))
+		except Exception as e:
+			self.log(f"Remove error: {e}")
+
 	def show_settings(self):
-		SettingsDialog(self.root, self.config, self.apply_settings)
+		SettingsDialog(self.root, self, self.config, self.apply_settings)
 
 	def apply_settings(self, new_config):
 		self.config.update(new_config)
 		self.save_config()
 
-		session_set_max_connections(self.session, self.config.get('max_connections', 500))
-		session_set_max_uploads(self.session, self.config.get('max_uploads', 50))
+		# Apply transparency
+		try:
+			alpha = float(self.config.get('window_transparency', 1.0))
+			alpha = min(max(alpha, 0.5), 1.0)
+			self.root.attributes('-alpha', alpha)
+		except Exception:
+			pass
+
+		session_set_max_connections(self.session, self.config.get('max_connections', 4000))
+		session_set_max_uploads(self.session, self.config.get('max_uploads', 1000))
 		session_set_download_rate_limit(self.session, self.config.get('global_dl_limit', 0))
 		session_set_upload_rate_limit(self.session, self.config.get('global_ul_limit', 0))
+
+		self.apply_speed_tuning()
 
 		port_range = self.config.get('port_range', [6881, 6891])
 		if session_listen_on(self.session, port_range[0], port_range[1]):
@@ -1525,9 +2093,11 @@ DHT Nodes: {getattr(sst, 'dht_nodes', 0)}
 		except Exception:
 			pass
 
+		self.apply_theme(self.config.get('theme', 'light'), self.config.get('background_image_path', None))
 		self.log("Settings applied")
 		self.dl_limit_var.set(self.format_speed_limit_display(self.config.get('global_dl_limit', 0)))
 		self.ul_limit_var.set(self.format_speed_limit_display(self.config.get('global_ul_limit', 0)))
+		self.theme_var.set(self.config.get('theme', 'light'))
 
 	def show_documentation(self):
 		try:
@@ -1549,6 +2119,21 @@ Tkinter: {tk.TkVersion}
 		self.log_text.delete(1.0, tk.END)
 		self.log_text.config(state=tk.DISABLED)
 		self.log("Log cleared")
+
+	def clear_all_logs(self):
+		try:
+			self.log_text.config(state=tk.NORMAL)
+			self.log_text.delete(1.0, tk.END)
+			self.log_text.config(state=tk.DISABLED)
+		except Exception:
+			pass
+		try:
+			self.live_status_text.config(state=tk.NORMAL)
+			self.live_status_text.delete(1.0, tk.END)
+			self.live_status_text.config(state=tk.DISABLED)
+		except Exception:
+			pass
+		self.log("All logs cleared (Log + Live)")
 
 	def save_log(self):
 		file_path = filedialog.asksaveasfilename(
@@ -1658,8 +2243,8 @@ Tkinter: {tk.TkVersion}
 		default_config = {
 			'download_path': default_downloads,
 			'completed_path': str(Path(default_downloads) / "Completed"),
-			'max_connections': 500,
-			'max_uploads': 50,
+			'max_connections': 4000,
+			'max_uploads': 1000,
 			'port_range': [6881, 6891],
 			'enable_dht': True,
 			'enable_lsd': True,
@@ -1671,13 +2256,23 @@ Tkinter: {tk.TkVersion}
 			'last_saved_torrent_dir': default_downloads,
 			'log_level': 'INFO',
 			'fast_download_default_enabled': True,
-			'fast_download_default_connections': 5,
-			'fast_download_sequential': True
+			'fast_download_default_connections': 20,
+			'fast_download_sequential': True,
+			# File selection behavior
+			'preselect_always': True,
+			'fast_download_prompt': False,
+			# Theme system
+			'theme': 'light',  # 'light' | 'dark' | 'tokyo-night'
+			'background_image_path': None,
+			'window_transparency': 1.0  # 0.5 .. 1.0
 		}
 		try:
 			if Path(config_file).exists():
 				with open(config_file, 'r', encoding='utf-8') as f:
 					loaded = json.load(f)
+				# Backward compat for old dark_mode flag
+				if 'dark_mode' in loaded and 'theme' not in loaded:
+					loaded['theme'] = 'dark' if loaded.get('dark_mode') else 'light'
 				return {**default_config, **loaded}
 		except Exception as e:
 			logger.warning(f"Config load error: {e}")
@@ -1778,8 +2373,6 @@ Tkinter: {tk.TkVersion}
 			self.session = None
 			self.root.destroy()
 
-	# Quick actions and helpers
-
 	def show_speed_limits(self):
 		SpeedLimitsDialog(self.root, self.session)
 
@@ -1861,7 +2454,7 @@ class FastDownloadDialog:
 	def __init__(self, parent, config):
 		self.result = {
 			'enabled': config.get('fast_download_default_enabled', True),
-			'connections': config.get('fast_download_default_connections', 5),
+			'connections': config.get('fast_download_default_connections', 20),
 			'sequential': config.get('fast_download_sequential', True)
 		}
 		self.dialog = tk.Toplevel(parent)
@@ -1878,17 +2471,17 @@ class FastDownloadDialog:
 		main.pack(fill=tk.BOTH, expand=True)
 
 		self.enable_var = tk.BooleanVar(value=self.result['enabled'])
-		ttk.Checkbutton(main, text="Enable Fast Download (multi-connection per torrent)", variable=self.enable_var).pack(anchor=tk.W, pady=(0, 8))
+		ttk.Checkbutton(main, text="Enable Fast Download (more connections, sequential optional)", variable=self.enable_var).pack(anchor=tk.W, pady=(0, 8))
 
 		row = ttk.Frame(main)
 		row.pack(fill=tk.X, pady=(0, 8))
 		ttk.Label(row, text="Connections:").pack(side=tk.LEFT)
 		self.conn_var = tk.StringVar(value=str(self.result['connections']))
 		ttk.Entry(row, textvariable=self.conn_var, width=6).pack(side=tk.LEFT, padx=(6, 0))
-		ttk.Label(row, text="(suggest 5–10)").pack(side=tk.LEFT, padx=(6, 0))
+		ttk.Label(row, text="(suggest 20–50)").pack(side=tk.LEFT, padx=(6, 0))
 
 		self.seq_var = tk.BooleanVar(value=self.result['sequential'])
-		ttk.Checkbutton(main, text="Sequential download (improves playback start, stable speed)", variable=self.seq_var).pack(anchor=tk.W)
+		ttk.Checkbutton(main, text="Sequential download (better preview/start)", variable=self.seq_var).pack(anchor=tk.W)
 
 		btns = ttk.Frame(main)
 		btns.pack(fill=tk.X, pady=(10, 0))
@@ -1900,9 +2493,9 @@ class FastDownloadDialog:
 
 	def ok(self):
 		try:
-			conns = max(1, min(50, int(float(self.conn_var.get()))))
+			conns = max(1, min(400, int(float(self.conn_var.get()))))
 		except Exception:
-			conns = 5
+			conns = 20
 		self.result = {
 			'enabled': bool(self.enable_var.get()),
 			'connections': conns,
@@ -1911,8 +2504,314 @@ class FastDownloadDialog:
 		self.dialog.destroy()
 
 	def cancel(self):
-		# Keep defaults as "disabled" so it's safe
-		self.result = {'enabled': False, 'connections': 5, 'sequential': True}
+		self.result = {'enabled': False, 'connections': 20, 'sequential': True}
+		self.dialog.destroy()
+
+class PreSelectChoiceDialog:
+	def __init__(self, parent, default=True):
+		self.result = default
+		self.dialog = tk.Toplevel(parent)
+		self.dialog.title("Preselect Files?")
+		self.dialog.transient(parent)
+		self.dialog.grab_set()
+		self.dialog.resizable(False, False)
+		self.dialog.update_idletasks()
+		x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
+		y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
+		self.dialog.geometry(f"+{x}+{y}")
+
+		main = ttk.Frame(self.dialog, padding="10 10 10 10")
+		main.pack(fill=tk.BOTH, expand=True)
+
+		self.var = tk.BooleanVar(value=default)
+		ttk.Checkbutton(main, text="Select files before starting download", variable=self.var).pack(anchor=tk.W, pady=(0, 8))
+
+		btns = ttk.Frame(main)
+		btns.pack(fill=tk.X, pady=(10, 0))
+		ttk.Button(btns, text="Skip", command=self.skip).pack(side=tk.RIGHT)
+		ttk.Button(btns, text="OK", command=self.ok).pack(side=tk.RIGHT, padx=(0, 6))
+
+		self.dialog.bind('<Return>', lambda e: self.ok())
+		self.dialog.wait_window()
+
+	def ok(self):
+		self.result = bool(self.var.get())
+		self.dialog.destroy()
+
+	def skip(self):
+		self.result = False
+		self.dialog.destroy()
+
+class PreFileSelectDialog:
+	def __init__(self, parent, torrent_info: lt.torrent_info):
+		self.result = None
+		self.ti = torrent_info
+		self.dialog = tk.Toplevel(parent)
+		self.dialog.title(f"Select Files: {torrent_info.name()[:40]}...")
+		self.dialog.transient(parent)
+		self.dialog.grab_set()
+		self.dialog.geometry("720x520")
+		self.dialog.resizable(True, True)
+		self.dialog.update_idletasks()
+		x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
+		y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
+		self.dialog.geometry(f"+{x}+{y}")
+
+		main = ttk.Frame(self.dialog, padding="10 10 10 10")
+		main.pack(fill=tk.BOTH, expand=True)
+
+		ttk.Label(main, text="Choose which files to download:").pack(anchor=tk.W, pady=(0, 8))
+
+		tree_frame = ttk.Frame(main)
+		tree_frame.pack(fill=tk.BOTH, expand=True)
+
+		self.tree = ttk.Treeview(tree_frame, columns=('Size',), show='tree headings', selectmode='extended')
+		self.tree.heading('#0', text='File')
+		self.tree.heading('Size', text='Size')
+		self.tree.column('#0', width=400)
+		self.tree.column('Size', width=140)
+		scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+		self.tree.configure(yscrollcommand=scroll.set)
+		self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+		scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+		files = self.ti.files()
+		tree_items = {}
+		def insert_recursive(path_parts, parent_id, file_index=-1):
+			if not path_parts:
+				return
+			part = path_parts[0]
+			current_id = f"{parent_id}/{part}" if parent_id else part
+			if current_id not in tree_items:
+				if len(path_parts) == 1 and file_index != -1:
+					size = files.file_size(file_index)
+					item_id = self.tree.insert(parent_id, tk.END, text=part, values=(TorrentClient.format_bytes(self=None, bytes_value=size),), tags=(str(file_index), 'file'))
+					tree_items[current_id] = item_id
+				else:
+					item_id = self.tree.insert(parent_id, tk.END, text=part, open=True, values=("",))
+					tree_items[current_id] = item_id
+			if len(path_parts) > 1:
+				insert_recursive(path_parts[1:], tree_items[current_id], file_index)
+
+		for i in range(self.ti.num_files()):
+			file_path = str(Path(files.file_path(i)))
+			insert_recursive(file_path.split(os.sep), '', i)
+
+		btns = ttk.Frame(main)
+		btns.pack(fill=tk.X, pady=(10, 0))
+		ttk.Button(btns, text="Select All", command=self.select_all).pack(side=tk.LEFT)
+		ttk.Button(btns, text="Select None", command=self.select_none).pack(side=tk.LEFT, padx=(5, 0))
+		ttk.Button(btns, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
+		ttk.Button(btns, text="OK", command=self.ok).pack(side=tk.RIGHT, padx=(0, 8))
+
+		self.dialog.bind('<Return>', lambda e: self.ok())
+		self.dialog.wait_window()
+
+	def select_all(self):
+		self.tree.selection_set(self.tree.get_children())
+		for item in self.tree.get_children():
+			self._select_all_children(item)
+
+	def _select_all_children(self, item):
+		for c in self.tree.get_children(item):
+			self.tree.selection_add(c)
+			self._select_all_children(c)
+
+	def select_none(self):
+		self.tree.selection_remove(self.tree.selection())
+
+	def ok(self):
+		selection = set()
+		def collect_files(item):
+			tags = self.tree.item(item, 'tags')
+			if 'file' in tags:
+				selection.add(int(tags[0]))
+			for c in self.tree.get_children(item):
+				collect_files(c)
+		for root in self.tree.get_children():
+			if root in self.tree.selection():
+				collect_files(root)
+			else:
+				for c in self.tree.get_children(root):
+					if c in self.tree.selection():
+						collect_files(c)
+		if not selection:
+			if not messagebox.askyesno("No Files Selected", "No files selected. Start with all files?", parent=self.dialog):
+				return
+			self.result = list(range(self.ti.num_files()))
+		else:
+			self.result = sorted(selection)
+		self.dialog.destroy()
+
+	def cancel(self):
+		self.result = None
+		self.dialog.destroy()
+
+class QuickPickDialog:
+	def __init__(self, parent, torrent_info: lt.torrent_info, preselected_indices):
+		self.result = None
+		self.ti = torrent_info
+		self.dialog = tk.Toplevel(parent)
+		self.dialog.title("Quick File Picker")
+		self.dialog.transient(parent)
+		self.dialog.grab_set()
+		self.dialog.resizable(True, True)
+		self.dialog.geometry("520x420")
+		self.dialog.update_idletasks()
+		x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
+		y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
+		self.dialog.geometry(f"+{x}+{y}")
+
+		main = ttk.Frame(self.dialog, padding="10 10 10 10")
+		main.pack(fill=tk.BOTH, expand=True)
+
+		ttk.Label(main, text="Quick pick which files to download:").pack(anchor=tk.W, pady=(0, 6))
+
+		self.listbox = tk.Listbox(main, selectmode=tk.EXTENDED)
+		self.listbox.pack(fill=tk.BOTH, expand=True)
+
+		files = self.ti.files()
+		self.index_map = []
+		for i in range(self.ti.num_files()):
+			name = str(Path(files.file_path(i)).name)
+			size = files.file_size(i)
+			self.listbox.insert(tk.END, f"{name}  ({TorrentClient.format_bytes(self=None, bytes_value=size)})")
+			self.index_map.append(i)
+
+		btns = ttk.Frame(main)
+		btns.pack(fill=tk.X, pady=(8, 0))
+		ttk.Button(btns, text="All", command=self.pick_all).pack(side=tk.LEFT)
+		ttk.Button(btns, text="None", command=self.pick_none).pack(side=tk.LEFT, padx=(5, 0))
+		ttk.Button(btns, text="Largest Only", command=self.pick_largest).pack(side=tk.LEFT, padx=(5, 0))
+		ttk.Button(btns, text="Selected Only", command=self.ok_selected).pack(side=tk.RIGHT)
+		ttk.Button(btns, text="Start All", command=self.ok_all).pack(side=tk.RIGHT, padx=(0, 6))
+
+		# Preselect any preselected indices from previous dialog
+		try:
+			if preselected_indices:
+				for i, idx in enumerate(self.index_map):
+					if idx in preselected_indices:
+						self.listbox.selection_set(i)
+		except Exception:
+			pass
+
+		self.dialog.bind('<Return>', lambda e: self.ok_selected())
+		self.dialog.wait_window()
+
+	def pick_all(self):
+		self.listbox.selection_set(0, tk.END)
+
+	def pick_none(self):
+		self.listbox.selection_clear(0, tk.END)
+
+	def pick_largest(self):
+		try:
+			files = self.ti.files()
+			largest_i = 0
+			max_s = -1
+			for i in range(self.ti.num_files()):
+				sz = files.file_size(i)
+				if sz > max_s:
+					max_s = sz
+					largest_i = i
+			self.listbox.selection_clear(0, tk.END)
+			self.listbox.selection_set(largest_i)
+		except Exception:
+			pass
+
+	def ok_all(self):
+		self.result = {'mode': 'all', 'selected': []}
+		self.dialog.destroy()
+
+	def ok_selected(self):
+		sel = list(self.listbox.curselection())
+		if not sel:
+			self.result = {'mode': 'all', 'selected': []}
+		else:
+			selected_idxs = [self.index_map[i] for i in sel]
+			self.result = {'mode': 'selected', 'selected': selected_idxs}
+		self.dialog.destroy()
+
+class PerTorrentSpeedDialog:
+	def __init__(self, parent, handle):
+		self.result = None
+		self.dialog = tk.Toplevel(parent)
+		self.dialog.title("Per-Torrent Speed & Connections")
+		self.dialog.transient(parent)
+		self.dialog.grab_set()
+		self.dialog.resizable(False, False)
+		self.dialog.update_idletasks()
+		x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
+		y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
+		self.dialog.geometry(f"+{x}+{y}")
+
+		main = ttk.Frame(self.dialog, padding="10 10 10 10")
+		main.pack(fill=tk.BOTH, expand=True)
+
+		cur_conns = 1000
+		cur_ups = 500
+		cur_dl = 0
+		cur_ul = 0
+		try:
+			st = handle.status()
+			# Not all bindings expose getters; use defaults if not
+		except Exception:
+			pass
+
+		row1 = ttk.Frame(main)
+		row1.pack(fill=tk.X, pady=(0, 6))
+		ttk.Label(row1, text="Connections:").pack(side=tk.LEFT)
+		self.conns_var = tk.StringVar(value=str(cur_conns))
+		ttk.Entry(row1, textvariable=self.conns_var, width=8).pack(side=tk.LEFT, padx=(6, 0))
+		ttk.Label(row1, text="Uploads:").pack(side=tk.LEFT, padx=(12,0))
+		self.ups_var = tk.StringVar(value=str(cur_ups))
+		ttk.Entry(row1, textvariable=self.ups_var, width=8).pack(side=tk.LEFT, padx=(6, 0))
+
+		row2 = ttk.Frame(main)
+		row2.pack(fill=tk.X, pady=(0, 6))
+		ttk.Label(row2, text="DL limit (KB/s, 0=∞):").pack(side=tk.LEFT)
+		self.dl_var = tk.StringVar(value=str(cur_dl // 1024 if cur_dl else 0))
+		ttk.Entry(row2, textvariable=self.dl_var, width=8).pack(side=tk.LEFT, padx=(6, 0))
+		ttk.Label(row2, text="UL limit (KB/s, 0=∞):").pack(side=tk.LEFT, padx=(12,0))
+		self.ul_var = tk.StringVar(value=str(cur_ul // 1024 if cur_ul else 0))
+		ttk.Entry(row2, textvariable=self.ul_var, width=8).pack(side=tk.LEFT, padx=(6, 0))
+
+		self.seq_var = tk.BooleanVar(value=True)
+		ttk.Checkbutton(main, text="Sequential download", variable=self.seq_var).pack(anchor=tk.W, pady=(4, 0))
+
+		btns = ttk.Frame(main)
+		btns.pack(fill=tk.X, pady=(10, 0))
+		ttk.Button(btns, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
+		ttk.Button(btns, text="Apply & Start", command=self.ok).pack(side=tk.RIGHT, padx=(0, 6))
+
+		self.dialog.wait_window()
+
+	def ok(self):
+		try:
+			conns = max(1, min(8000, int(float(self.conns_var.get()))))
+		except Exception:
+			conns = 1000
+		try:
+			ups = max(1, min(4000, int(float(self.ups_var.get()))))
+		except Exception:
+			ups = 500
+		def kb_to_b(s):
+			try:
+				v = int(float(s))
+				return max(0, v * 1024)
+			except Exception:
+				return 0
+		self.result = {
+			'connections': conns,
+			'uploads': ups,
+			'dl_limit': kb_to_b(self.dl_var.get()),
+			'ul_limit': kb_to_b(self.ul_var.get()),
+			'sequential': bool(self.seq_var.get())
+		}
+		self.dialog.destroy()
+
+	def cancel(self):
+		self.result = None
 		self.dialog.destroy()
 
 class MagnetDialog:
@@ -1975,7 +2874,7 @@ class MultiMagnetDialog:
 		self.dialog.title("Add Multiple Magnets")
 		self.dialog.transient(parent)
 		self.dialog.grab_set()
-		self.dialog.geometry("680x400")
+		self.dialog.geometry("680x420")
 		self.dialog.update_idletasks()
 		x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
 		y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
@@ -1996,7 +2895,7 @@ class MultiMagnetDialog:
 		ttk.Entry(path_frame, textvariable=self.path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
 		ttk.Button(path_frame, text="Browse...", command=self.browse_path).pack(side=tk.RIGHT, padx=(5, 0))
 
-		btns = ttk.Frame(main, padding="0 10 10 0")
+		btns = ttk.Frame(self.dialog, padding="0 10 10 0")
 		btns.pack(fill=tk.X, pady=(10, 0))
 		ttk.Button(btns, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
 		ttk.Button(btns, text="Add All", command=self.add_all).pack(side=tk.RIGHT, padx=(0, 5))
@@ -2075,7 +2974,9 @@ class UrlDialog:
 		self.dialog.destroy()
 
 class SettingsDialog:
-	def __init__(self, parent, config, apply_callback):
+	def __init__(self, parent, app, config, apply_callback):
+		self.parent = parent
+		self.app = app  # TorrentClient reference for session and theme
 		self.config = config.copy()
 		self.apply_callback = apply_callback
 
@@ -2083,12 +2984,13 @@ class SettingsDialog:
 		self.dialog.title("Settings")
 		self.dialog.transient(parent)
 		self.dialog.grab_set()
+		self.dialog.resizable(True, True)
+		self.dialog.geometry("860x680")
 
 		self.dialog.update_idletasks()
 		x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
 		y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
 		self.dialog.geometry(f"+{x}+{y}")
-		self.dialog.resizable(False, False)
 
 		main = ttk.Frame(self.dialog, padding="10 10 10 10")
 		main.pack(fill=tk.BOTH, expand=True)
@@ -2096,22 +2998,47 @@ class SettingsDialog:
 		notebook = ttk.Notebook(main)
 		notebook.pack(fill=tk.BOTH, expand=True)
 
-		general_frame = ttk.Frame(notebook, padding="5 5 5 5")
-		notebook.add(general_frame, text="General")
-		self.create_general_settings(general_frame)
+		# Use scrollable frames for each tab to ensure full visibility on smaller screens
+		self.general_frame = self._make_scrollable_tab(notebook, "General")
+		self.connection_frame = self._make_scrollable_tab(notebook, "Connection")
+		self.speed_limits_frame = self._make_scrollable_tab(notebook, "Speed Limits")
 
-		connection_frame = ttk.Frame(notebook, padding="5 5 5 5")
-		notebook.add(connection_frame, text="Connection")
-		self.create_connection_settings(connection_frame)
-
-		speed_limits_frame = ttk.Frame(notebook, padding="5 5 5 5")
-		notebook.add(speed_limits_frame, text="Speed Limits")
-		self.create_speed_limits_settings(speed_limits_frame)
+		self.create_general_settings(self.general_frame.content)
+		self.create_connection_settings(self.connection_frame.content)
+		self.create_speed_limits_settings(self.speed_limits_frame.content)
 
 		button_frame = ttk.Frame(self.dialog, padding="0 10 10 10")
 		button_frame.pack(fill=tk.X)
 		ttk.Button(button_frame, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
 		ttk.Button(button_frame, text="Apply", command=self.apply).pack(side=tk.RIGHT, padx=(0, 5))
+
+	def _make_scrollable_tab(self, notebook, title):
+		container = ttk.Frame(notebook)
+		notebook.add(container, text=title)
+		canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+		vscroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+		content = ttk.Frame(canvas)
+
+		content_id = canvas.create_window((0, 0), window=content, anchor="nw")
+		canvas.configure(yscrollcommand=vscroll.set)
+
+		def _on_frame_configure(_evt=None):
+			canvas.configure(scrollregion=canvas.bbox("all"))
+			canvas_width = canvas.winfo_width()
+			try:
+				canvas.itemconfig(content_id, width=canvas_width)
+			except Exception:
+				pass
+
+		content.bind("<Configure>", _on_frame_configure)
+		canvas.bind("<Configure>", _on_frame_configure)
+		canvas.pack(side="left", fill="both", expand=True)
+		vscroll.pack(side="right", fill="y")
+
+		# attach references
+		container.canvas = canvas
+		container.content = content
+		return container
 
 	def create_general_settings(self, parent):
 		ttk.Label(parent, text="Default Download Path:").pack(anchor=tk.W, pady=(0, 5))
@@ -2128,6 +3055,20 @@ class SettingsDialog:
 		ttk.Entry(comp_frame, textvariable=self.completed_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
 		ttk.Button(comp_frame, text="Browse...", command=self.browse_completed_path).pack(side=tk.RIGHT, padx=(5, 0))
 
+		ttk.Label(parent, text="Theme:").pack(anchor=tk.W, pady=(0, 5))
+		theme_row = ttk.Frame(parent)
+		theme_row.pack(fill=tk.X, pady=(0, 10))
+		self.theme_var = tk.StringVar(value=str(self.config.get('theme', 'light')))
+		ttk.Combobox(theme_row, textvariable=self.theme_var, state='readonly', values=['light','dark','tokyo-night']).pack(side=tk.LEFT)
+		ttk.Button(theme_row, text="Choose Background Image...", command=self.choose_bg_image).pack(side=tk.LEFT, padx=(8, 0))
+
+		ttk.Label(parent, text="Window Transparency (0.5 – 1.0):").pack(anchor=tk.W, pady=(0, 5))
+		alpha_row = ttk.Frame(parent)
+		alpha_row.pack(fill=tk.X, pady=(0, 10))
+		self.alpha_var = tk.StringVar(value=str(self.config.get('window_transparency', 1.0)))
+		ttk.Entry(alpha_row, textvariable=self.alpha_var, width=6).pack(side=tk.LEFT)
+		ttk.Label(alpha_row, text="Lower = more transparent").pack(side=tk.LEFT, padx=(8, 0))
+
 		ttk.Label(parent, text="Fast Download default:").pack(anchor=tk.W, pady=(0, 5))
 		fd_frame = ttk.Frame(parent)
 		fd_frame.pack(fill=tk.X, pady=(0, 10))
@@ -2136,18 +3077,32 @@ class SettingsDialog:
 		fd2 = ttk.Frame(parent)
 		fd2.pack(fill=tk.X, pady=(0, 10))
 		ttk.Label(fd2, text="Connections:").pack(side=tk.LEFT)
-		self.fd_conn_var = tk.StringVar(value=str(self.config.get('fast_download_default_connections', 5)))
+		self.fd_conn_var = tk.StringVar(value=str(self.config.get('fast_download_default_connections', 20)))
 		ttk.Entry(fd2, textvariable=self.fd_conn_var, width=6).pack(side=tk.LEFT, padx=(6, 0))
 		self.fd_seq_var = tk.BooleanVar(value=self.config.get('fast_download_sequential', True))
 		ttk.Checkbutton(parent, text="Sequential download default", variable=self.fd_seq_var).pack(anchor=tk.W)
 
+		# Always show file selection
+		self.preselect_always_var = tk.BooleanVar(value=self.config.get('preselect_always', True))
+		ttk.Checkbutton(parent, text="Always show file picker on add", variable=self.preselect_always_var).pack(anchor=tk.W, pady=(10, 0))
+
+	def choose_bg_image(self):
+		path = filedialog.askopenfilename(
+			title="Choose Background Image",
+			filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"), ("All files", "*.*")]
+		)
+		if not path:
+			return
+		self.config['background_image_path'] = path
+		messagebox.showinfo("Theme", "Background image set. Click Apply to use it.", parent=self.dialog)
+
 	def create_connection_settings(self, parent):
 		ttk.Label(parent, text="Maximum Connections:").pack(anchor=tk.W, pady=(0, 5))
-		self.max_connections_var = tk.StringVar(value=str(self.config.get('max_connections', 500)))
+		self.max_connections_var = tk.StringVar(value=str(self.config.get('max_connections', 4000)))
 		ttk.Entry(parent, textvariable=self.max_connections_var).pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
 
 		ttk.Label(parent, text="Maximum Uploads:").pack(anchor=tk.W, pady=(0, 5))
-		self.max_uploads_var = tk.StringVar(value=str(self.config.get('max_uploads', 50)))
+		self.max_uploads_var = tk.StringVar(value=str(self.config.get('max_uploads', 1000)))
 		ttk.Entry(parent, textvariable=self.max_uploads_var).pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
 
 		ttk.Label(parent, text="Listen Port Range:").pack(anchor=tk.W, pady=(0, 5))
@@ -2169,24 +3124,18 @@ class SettingsDialog:
 		self.global_ul_limit_var = tk.StringVar(value=str(int(self.config.get('global_ul_limit', 0)) // 1024))
 		ttk.Entry(parent, textvariable=self.global_ul_limit_var).pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
 
-	def browse_download_path(self):
-		path = filedialog.askdirectory(initialdir=self.download_path_var.get(), parent=self.dialog)
-		if path:
-			self.download_path_var.set(path)
-
-	def browse_completed_path(self):
-		path = filedialog.askdirectory(initialdir=self.completed_path_var.get(), parent=self.dialog)
-		if path:
-			self.completed_path_var.set(path)
-
 	def apply(self):
 		try:
 			dl_limit_val = int(float(self.global_dl_limit_var.get()) * 1024)
 			ul_limit_val = int(float(self.global_ul_limit_var.get()) * 1024)
 			port_start = int(self.port_start_var.get())
 			port_end = int(self.port_end_var.get())
+			alpha = float(self.alpha_var.get())
 			if not (1 <= port_start <= 65535 and 1 <= port_end <= 65535 and port_start <= port_end):
 				messagebox.showerror("Invalid Input", "Port range must be 1..65535 and start <= end.", parent=self.dialog)
+				return
+			if not (0.5 <= alpha <= 1.0):
+				messagebox.showerror("Invalid Input", "Transparency must be between 0.5 and 1.0", parent=self.dialog)
 				return
 			new_config = {
 				'download_path': self.download_path_var.get(),
@@ -2201,13 +3150,27 @@ class SettingsDialog:
 				'global_dl_limit': max(0, dl_limit_val),
 				'global_ul_limit': max(0, ul_limit_val),
 				'fast_download_default_enabled': bool(self.fd_enabled_var.get()),
-				'fast_download_default_connections': max(1, min(50, int(float(self.fd_conn_var.get()) if self.fd_conn_var.get() else 5))),
-				'fast_download_sequential': bool(self.fd_seq_var.get())
+				'fast_download_default_connections': max(1, min(400, int(float(self.fd_conn_var.get()) if self.fd_conn_var.get() else 20))),
+				'fast_download_sequential': bool(self.fd_seq_var.get()),
+				'theme': str(self.theme_var.get()).strip(),
+				'background_image_path': self.config.get('background_image_path', None),
+				'window_transparency': alpha,
+				'preselect_always': bool(self.preselect_always_var.get())
 			}
 			self.apply_callback(new_config)
 			self.dialog.destroy()
 		except Exception:
 			messagebox.showerror("Invalid Input", "Please enter valid numeric values.", parent=self.dialog)
+
+	def browse_download_path(self):
+		path = filedialog.askdirectory(initialdir=self.download_path_var.get(), parent=self.dialog)
+		if path:
+			self.download_path_var.set(path)
+
+	def browse_completed_path(self):
+		path = filedialog.askdirectory(initialdir=self.completed_path_var.get(), parent=self.dialog)
+		if path:
+			self.completed_path_var.set(path)
 
 	def cancel(self):
 		self.dialog.destroy()
@@ -2235,11 +3198,11 @@ class FilePriorityDialog:
 
 		columns = ('File', 'Size', 'Priority')
 		self.tree = ttk.Treeview(tree_frame, columns=columns, show='tree headings', selectmode='extended')
-		self.tree.column('#0', width=280, stretch=tk.NO)
+		self.tree.column('#0', width=320, stretch=tk.NO)
 		self.tree.heading('#0', text='File')
 		for col in columns[1:]:
 			self.tree.heading(col, text=col)
-			self.tree.column(col, width=120)
+			self.tree.column(col, width=140)
 
 		scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
 		self.tree.configure(yscrollcommand=scroll.set)
@@ -2330,7 +3293,7 @@ class PerformanceGraphDialog:
 		self.performance_stats = performance_stats
 		self.dialog = tk.Toplevel(parent)
 		self.dialog.title("Performance Graph")
-		self.dialog.geometry("880x620")
+		self.dialog.geometry("920x660")
 		self.dialog.transient(parent)
 		self.dialog.grab_set()
 		self.dialog.update_idletasks()
@@ -2479,7 +3442,7 @@ class DownloadHistoryDialog:
 		self.download_history = download_history
 		self.dialog = tk.Toplevel(parent)
 		self.dialog.title("Download History")
-		self.dialog.geometry("940x440")
+		self.dialog.geometry("980x520")
 		self.dialog.transient(parent)
 		self.dialog.grab_set()
 		self.dialog.update_idletasks()
@@ -2497,7 +3460,7 @@ class DownloadHistoryDialog:
 		self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
 		for col in columns:
 			self.tree.heading(col, text=col)
-			self.tree.column(col, width=180)
+			self.tree.column(col, width=200)
 
 		scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
 		self.tree.configure(yscrollcommand=scroll.set)
